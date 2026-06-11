@@ -292,7 +292,10 @@ def test_deleted_logbook_entries_are_not_included_in_llm_recent_memories(tmp_pat
     fake_llm = FakeLlmClient()
     app = create_app(db_path=str(tmp_path / "test.sqlite3"), llm_client=fake_llm)
     client = TestClient(app)
-    profile = create_profile(client)
+    profile = client.post(
+        "/api/profiles",
+        json={"memory_controls": {"long_term_memory_enabled": True, "allow_logbook_personalization": True}},
+    ).json()["profile"]
     profile_id = profile["id"]
 
     session_id = client.post(
@@ -347,6 +350,38 @@ def test_memory_controls_can_disable_llm_logbook_personalization(tmp_path):
     response = client.post(
         "/api/chat/turn",
         json={"session_id": session_id, "free_input": "기억은 빼고 지금 장면만 이야기해줘"},
+    )
+    assert response.status_code == 200
+    assert fake_llm.contexts[-1].recent_memories == []
+
+
+def test_long_term_memory_disabled_prevents_llm_recent_memories(tmp_path):
+    fake_llm = FakeLlmClient()
+    app = create_app(db_path=str(tmp_path / "test.sqlite3"), llm_client=fake_llm)
+    client = TestClient(app)
+    profile = client.post(
+        "/api/profiles",
+        json={
+            "memory_controls": {
+                "long_term_memory_enabled": False,
+                "allow_logbook_personalization": True,
+            }
+        },
+    ).json()["profile"]
+    profile_id = profile["id"]
+
+    session_id = client.post(
+        "/api/chat/turn",
+        json={"profile_id": profile_id, "plot_id": "p_luminote_001_first_light"},
+    ).json()["session"]["id"]
+    client.post(
+        "/api/chat/turn",
+        json={"session_id": session_id, "choice_id": "choose_gold_light"},
+    )
+
+    response = client.post(
+        "/api/chat/turn",
+        json={"session_id": session_id, "free_input": "지금 장면만 이어가줘"},
     )
     assert response.status_code == 200
     assert fake_llm.contexts[-1].recent_memories == []
@@ -734,6 +769,42 @@ def test_admin_plot_card_create_blocks_unsafe_content(tmp_path):
     assert detail["ok"] is False
     assert "real_ip" in detail["blocked_categories"]
     assert "external_contact" in detail["blocked_categories"]
+
+
+def test_admin_plot_card_requires_three_standard_choices(tmp_path):
+    client = make_client(tmp_path)
+
+    response = client.post(
+        "/api/admin/plot-cards",
+        json={
+            "title": "두 갈래 선택 플롯",
+            "member_id": "L-04",
+            "member_role": "기록 안내자",
+            "one_line_hook": "안전한 선택만 남기는 연습을 한다.",
+            "relationship_frame": "기록원과 안내자",
+            "estimated_time": "4min",
+            "quest_type": "creative_participation",
+            "tags": ["safe"],
+            "opening_scene": "정리된 기록실에서 오늘의 선택지를 점검한다.",
+            "choices": [
+                {"id": "a", "label": "첫 선택", "tags": ["care"], "effect": "trust +1"},
+                {"id": "b", "label": "둘 선택", "tags": ["creative"], "effect": "inspiration +1"},
+                {"id": "free_input", "label": "직접 말하기", "tags": ["free_input"], "effect": "classify_input_then_apply_safe_summary"},
+            ],
+            "completion_reward": {
+                "type": "logbook_fragment",
+                "title": "미완성 카드",
+                "safe_summary_template": "사용자는 안전한 형식 검증을 거쳤다.",
+            },
+            "status": "published",
+            "approval_status": "approved",
+        },
+    )
+
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert detail["ok"] is False
+    assert "플롯 카드는 최소 3개의 일반 선택지가 필요합니다." in detail["errors"]
 
 
 

@@ -616,7 +616,11 @@ def maybe_generate_llm_reply(
     profile_id = session.get("profile_id")
     if profile_id is not None:
         profile = repo.get_profile(str(profile_id))
-        if profile is not None and profile["memory_controls"].get("allow_logbook_personalization", True):
+        if (
+            profile is not None
+            and profile["memory_controls"].get("long_term_memory_enabled", True)
+            and profile["memory_controls"].get("allow_logbook_personalization", True)
+        ):
             recent_memories = repo.list_recent_memory_summaries_for_session(str(session["id"]))
     context = LlmContext(
         plot_title=str(card["title"]),
@@ -733,7 +737,7 @@ def validate_plot_payload(request: AdminPlotCardCreateRequest) -> dict[str, obje
 
 
 def validate_plot_data(data: dict[str, Any]) -> dict[str, object]:
-    return validate_operator_content(
+    validation = validate_operator_content(
         data["title"],
         data["one_line_hook"],
         data["opening_scene"],
@@ -742,6 +746,12 @@ def validate_plot_data(data: dict[str, Any]) -> dict[str, object]:
         *(choice["label"] for choice in data["choices"]),
         data["completion_reward"]["safe_summary_template"],
     )
+    standard_choices = [choice for choice in data["choices"] if choice.get("id") != "free_input"]
+    if len(standard_choices) < 3:
+        validation_errors = list(validation["errors"])
+        validation["ok"] = False
+        validation["errors"] = [*validation_errors, "플롯 카드는 최소 3개의 일반 선택지가 필요합니다."]
+    return validation
 
 
 
