@@ -19,6 +19,27 @@ def make_client(tmp_path):
     return TestClient(app)
 
 
+def create_profile(client: TestClient) -> dict:
+    response = client.post(
+        "/api/profiles",
+        json={
+            "support_style": "세계관 탐험형",
+            "safety_preferences": {
+                "romance_minimized": True,
+                "bright_tone": True,
+                "short_replies": False,
+                "night_rest_reminder": True,
+            },
+            "memory_controls": {
+                "long_term_memory_enabled": False,
+                "allow_logbook_personalization": True,
+            },
+        },
+    )
+    assert response.status_code == 201
+    return response.json()["profile"]
+
+
 def test_lists_five_official_plot_cards(tmp_path):
     client = make_client(tmp_path)
 
@@ -29,6 +50,45 @@ def test_lists_five_official_plot_cards(tmp_path):
     assert len(cards) == 5
     assert cards[0]["title"] == "리허설의 첫 불빛"
     assert all(card["safety"]["official"] for card in cards)
+
+
+def test_profile_create_get_and_patch(tmp_path):
+    client = make_client(tmp_path)
+
+    created = create_profile(client)
+    profile_id = created["id"]
+
+    assert created["kind"] == "guest"
+    assert created["support_style"] == "세계관 탐험형"
+    assert created["safety_preferences"]["romance_minimized"] is True
+    assert created["memory_controls"]["long_term_memory_enabled"] is False
+
+    fetched = client.get(f"/api/profiles/{profile_id}")
+    assert fetched.status_code == 200
+    assert fetched.json()["profile"]["id"] == profile_id
+
+    patched = client.patch(
+        f"/api/profiles/{profile_id}",
+        json={
+            "support_style": "짧은 일상 대화형",
+            "safety_preferences": {
+                "short_replies": True,
+                "night_rest_reminder": False,
+            },
+            "memory_controls": {
+                "long_term_memory_enabled": True,
+            },
+        },
+    )
+
+    assert patched.status_code == 200
+    body = patched.json()["profile"]
+    assert body["support_style"] == "짧은 일상 대화형"
+    assert body["safety_preferences"]["romance_minimized"] is True
+    assert body["safety_preferences"]["short_replies"] is True
+    assert body["safety_preferences"]["night_rest_reminder"] is False
+    assert body["memory_controls"]["long_term_memory_enabled"] is True
+    assert body["memory_controls"]["allow_logbook_personalization"] is True
 
 
 def test_chat_turn_starts_session_and_persists_logbook(tmp_path):
@@ -55,6 +115,42 @@ def test_chat_turn_starts_session_and_persists_logbook(tmp_path):
     assert logbook_response.status_code == 200
     entries = logbook_response.json()["entries"]
     assert entries[0]["title"] == "첫 불빛의 색"
+
+
+def test_home_and_continue_return_active_session_profile_and_recent_logbook(tmp_path):
+    client = make_client(tmp_path)
+    profile = create_profile(client)
+    profile_id = profile["id"]
+
+    session_id = client.post(
+        "/api/chat/turn",
+        json={"profile_id": profile_id, "plot_id": "p_luminote_001_first_light"},
+    ).json()["session"]["id"]
+
+    choice_response = client.post(
+        "/api/chat/turn",
+        json={"session_id": session_id, "choice_id": "choose_gold_light"},
+    )
+    assert choice_response.status_code == 200
+
+    home_response = client.get(f"/api/profiles/{profile_id}/home")
+    assert home_response.status_code == 200
+    home = home_response.json()
+    assert home["profile"]["id"] == profile_id
+    assert home["active_quest"]["plot_id"] == "p_luminote_001_first_light"
+    assert home["continue_session"]["session_id"] == session_id
+    assert home["continue_session"]["relationship_summary"]
+    assert home["safety_preferences"]["romance_minimized"] is True
+    assert len(home["recent_logbook"]) == 1
+    assert home["recent_logbook"][0]["session_id"] == session_id
+
+    continue_response = client.get(f"/api/profiles/{profile_id}/continue")
+    assert continue_response.status_code == 200
+    continuation = continue_response.json()
+    assert continuation["session"]["id"] == session_id
+    assert continuation["session"]["active_quest"]["step"] == 2
+    assert continuation["relationship_summary"] == home["relationship_summary"]
+    assert continuation["recent_logbook"][0]["title"] == "첫 불빛의 색"
 
 
 def test_unsafe_free_input_is_not_saved_raw(tmp_path):

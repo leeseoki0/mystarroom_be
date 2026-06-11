@@ -16,14 +16,40 @@ from .safety import validate_operator_content
 
 class ChatTurnRequest(BaseModel):
     session_id: str | None = None
+    profile_id: str | None = None
     plot_id: str | None = None
     choice_id: str | None = None
     free_input: str | None = None
 
 
+class SafetyPreferencesPayload(BaseModel):
+    romance_minimized: bool | None = None
+    bright_tone: bool | None = None
+    short_replies: bool | None = None
+    night_rest_reminder: bool | None = None
+
+
+class MemoryControlsPayload(BaseModel):
+    long_term_memory_enabled: bool | None = None
+    allow_logbook_personalization: bool | None = None
+
+
+class ProfileCreateRequest(BaseModel):
+    support_style: str = Field(default="따뜻한 응원형")
+    safety_preferences: SafetyPreferencesPayload = Field(default_factory=SafetyPreferencesPayload)
+    memory_controls: MemoryControlsPayload = Field(default_factory=MemoryControlsPayload)
+
+
+class ProfileUpdateRequest(BaseModel):
+    support_style: str | None = None
+    safety_preferences: SafetyPreferencesPayload | None = None
+    memory_controls: MemoryControlsPayload | None = None
+
+
 class AdminPlotValidationRequest(BaseModel):
     title: str = Field(default="")
     one_line_hook: str = Field(default="")
+
 
 
 def create_app(db_path: str | None = None, llm_client: LlmClient | None = None) -> FastAPI:
@@ -52,20 +78,85 @@ def create_app(db_path: str | None = None, llm_client: LlmClient | None = None) 
     def list_plot_cards() -> dict[str, object]:
         return {"plot_cards": PLOT_CARDS}
 
+    @app.post("/api/profiles", status_code=201)
+    def create_profile(request: ProfileCreateRequest) -> dict[str, object]:
+        profile = repo.create_profile(
+            support_style=request.support_style,
+            safety_preferences=to_payload_dict(request.safety_preferences),
+            memory_controls=to_payload_dict(request.memory_controls),
+        )
+        return {"profile": profile}
+
+    @app.get("/api/profiles/{profile_id}")
+    def get_profile(profile_id: str) -> dict[str, object]:
+        profile = require_profile(repo, profile_id)
+        return {"profile": profile}
+
+    @app.patch("/api/profiles/{profile_id}")
+    def update_profile(profile_id: str, request: ProfileUpdateRequest) -> dict[str, object]:
+        profile = repo.update_profile(
+            profile_id,
+            support_style=request.support_style,
+            safety_preferences=to_payload_dict(request.safety_preferences),
+            memory_controls=to_payload_dict(request.memory_controls),
+        )
+        if profile is None:
+            raise HTTPException(status_code=404, detail="profile not found")
+        return {"profile": profile}
+
+    @app.get("/api/profiles/{profile_id}/home")
+    def get_home(profile_id: str) -> dict[str, object]:
+        profile = require_profile(repo, profile_id)
+        session = repo.get_active_session_for_profile(profile_id)
+        recent_logbook = repo.list_recent_logbook_entries_for_profile(profile_id)
+        return {
+            "profile": profile,
+            "continue_session": continue_summary(session),
+            "active_quest": active_quest_summary(session),
+            "relationship_summary": relationship_summary(session),
+            "safety_preferences": profile["safety_preferences"],
+            "recent_logbook": recent_logbook,
+        }
+
+    @app.get("/api/profiles/{profile_id}/continue")
+    def get_continue(profile_id: str) -> dict[str, object]:
+        profile = require_profile(repo, profile_id)
+        session = repo.get_active_session_for_profile(profile_id)
+        if session is None:
+            return {
+                "profile": profile,
+                "session": None,
+                "relationship_summary": None,
+                "safety_preferences": profile["safety_preferences"],
+                "recent_logbook": [],
+            }
+        return {
+            "profile": profile,
+            "session": public_session(session),
+            "relationship_summary": relationship_summary(session),
+            "safety_preferences": profile["safety_preferences"],
+            "recent_logbook": repo.list_recent_logbook_entries_for_profile(profile_id),
+        }
+
     @app.post("/api/chat/turn")
     def chat_turn(request: ChatTurnRequest) -> dict[str, object]:
+        if request.profile_id is not None and repo.get_profile(request.profile_id) is None:
+            raise HTTPException(status_code=404, detail="profile not found")
+
         if request.session_id is None:
             if request.plot_id is None:
                 raise HTTPException(status_code=400, detail="plot_id is required to start a session")
             card = find_plot(request.plot_id)
             if card is None:
                 raise HTTPException(status_code=404, detail="plot not found")
-            session = repo.create_session(request.plot_id)
+            session = repo.create_session(request.plot_id, request.profile_id)
             return turn_response(start_message(card, session), card, session, repo, "scripted")
 
         session = repo.get_session(request.session_id)
         if session is None:
             raise HTTPException(status_code=404, detail="session not found")
+        if request.profile_id is not None:
+            session["profile_id"] = request.profile_id
         card = find_plot(session["plot_id"])
         if card is None:
             raise HTTPException(status_code=404, detail="plot not found")
@@ -103,9 +194,63 @@ def create_app(db_path: str | None = None, llm_client: LlmClient | None = None) 
     return app
 
 
+
+def require_profile(repo: Repository, profile_id: str) -> dict[str, Any]:
+    profile = repo.get_profile(profile_id)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="profile not found")
+    return profile
+
+
+
+def to_payload_dict(model: BaseModel | None) -> dict[str, Any] | None:
+    if model is None:
+        return None
+    return model.model_dump(exclude_none=True)
+
+
+
+def relationship_summary(session: dict[str, Any] | None) -> str | None:
+    if session is None:
+        return None
+    return str(session["relationship"]["display_summary"])
+
+
+def continue_summary(session: dict[str, Any] | None) -> dict[str, object] | None:
+
+    if session is None:
+        return None
+    card = find_plot(str(session["plot_id"]))
+    return {
+        "session_id": session["id"],
+        "plot_id": session["plot_id"],
+        "plot_title": None if card is None else card["title"],
+        "step": session["step"],
+        "total_steps": session["total_steps"],
+        "completed": session["completed"],
+        "relationship_summary": relationship_summary(session),
+    }
+
+
+
+def active_quest_summary(session: dict[str, Any] | None) -> dict[str, object] | None:
+    if session is None:
+        return None
+    card = find_plot(str(session["plot_id"]))
+    return {
+        "plot_id": session["plot_id"],
+        "title": None if card is None else card["title"],
+        "step": session["step"],
+        "total_steps": session["total_steps"],
+        "completed": session["completed"],
+    }
+
+
+
 def public_session(session: dict[str, object]) -> dict[str, object]:
     return {
         "id": session["id"],
+        "profile_id": session.get("profile_id"),
         "active_quest": {
             "plot_id": session["plot_id"],
             "step": session["step"],
@@ -115,6 +260,7 @@ def public_session(session: dict[str, object]) -> dict[str, object]:
         "relationship": session["relationship"],
         "safety_events": session["safety_events"],
     }
+
 
 
 def turn_response(
@@ -131,6 +277,7 @@ def turn_response(
         "logbook": {"entries": repo.list_logbook_entries(str(session["id"]))},
         "llm_mode": llm_mode,
     }
+
 
 
 def maybe_generate_llm_reply(

@@ -5,8 +5,10 @@ FastAPI + SQLite backend for the Mystarroom / Luminote AI fan service MVP.
 ## Features
 
 - Official MVP plot card API
+- Guest profile onboarding/profile API with support style, safety preferences, and memory controls
+- Home/continue APIs for active quest, relationship summary, and recent logbook entries
 - Chat turn API for plot start, guided choices, and free input
-- SQLite-backed session and logbook persistence
+- SQLite-backed profile, session, and logbook persistence
 - Safety checks for real IP references, external contact/private info, and overdependence patterns
 - Optional OpenAI-compatible LLM provider for LM Studio or similar servers, with scripted fallback
 - Operator plot-card validation endpoint
@@ -58,6 +60,11 @@ pytest -q
 
 - `GET /api/health`
 - `GET /api/plot-cards`
+- `POST /api/profiles`
+- `GET /api/profiles/{profile_id}`
+- `PATCH /api/profiles/{profile_id}`
+- `GET /api/profiles/{profile_id}/home`
+- `GET /api/profiles/{profile_id}/continue`
 - `POST /api/chat/turn`
 - `GET /api/sessions/{session_id}/logbook`
 - `POST /api/admin/plot-cards/validate`
