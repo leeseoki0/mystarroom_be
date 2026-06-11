@@ -377,6 +377,10 @@ def create_app(db_path: str | None = None, llm_client: LlmClient | None = None) 
                 session_id = str(entry["session_id"])
             if session is None:
                 session = repo.get_session(session_id)
+            if session is not None:
+                session_profile_id = str(session["profile_id"]) if session.get("profile_id") is not None else None
+                if profile_id is not None and session_profile_id is not None and session_profile_id != profile_id:
+                    raise HTTPException(status_code=400, detail="session does not belong to profile")
             if profile_id is None and session is not None and session.get("profile_id") is not None:
                 profile_id = str(session["profile_id"])
 

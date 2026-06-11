@@ -577,6 +577,44 @@ def test_report_rejects_session_profile_mismatch(tmp_path):
     assert response.json()["detail"] == "session does not belong to profile"
 
 
+def test_report_rejects_logbook_profile_mismatch_without_session_id(tmp_path):
+    client = make_client(tmp_path)
+    owner = create_profile(client)
+    other = create_profile(client)
+
+    started = client.post(
+        "/api/chat/turn",
+        json={"profile_id": owner["id"], "plot_id": "p_luminote_001_first_light"},
+    )
+    session_id = started.json()["session"]["id"]
+
+    turn = client.post(
+        "/api/chat/turn",
+        json={
+            "profile_id": owner["id"],
+            "session_id": session_id,
+            "free_input": "함께 무대 인사를 연습하자",
+        },
+    )
+    logbook_entry_id = turn.json()["logbook"]["entries"][0]["id"]
+
+    response = client.post(
+        "/api/reports",
+        json={
+            "profile_id": other["id"],
+            "logbook_entry_id": logbook_entry_id,
+            "reason": "다른 프로필로 잘못 신고 요청",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "session does not belong to profile"
+
+    admin_reports = client.get("/api/admin/reports")
+    assert admin_reports.status_code == 200
+    assert admin_reports.json()["reports"] == []
+
+
 def test_admin_validation_rejects_real_ip(tmp_path):
     client = make_client(tmp_path)
 
