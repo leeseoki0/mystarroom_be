@@ -7,10 +7,9 @@ from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from .chatbot import apply_choice, apply_free_input, find_plot, start_message
+from .chatbot import apply_choice, apply_free_input, start_message
 from .llm_client import LlmClient, LlmContext, build_llm_client_from_env
-from .plot_cards import PLOT_CARDS
-from .repository import Repository
+from .repository import Repository, slugify_identifier
 from .safety import validate_operator_content
 
 
@@ -46,9 +45,92 @@ class ProfileUpdateRequest(BaseModel):
     memory_controls: MemoryControlsPayload | None = None
 
 
+class PlotChoicePayload(BaseModel):
+    id: str
+    label: str
+    tags: list[str]
+    effect: str
+
+
+class CompletionRewardPayload(BaseModel):
+    type: str
+    title: str
+    safe_summary_template: str
+
+
+class PlotSafetyPayload(BaseModel):
+    official: bool | None = True
+    ip_safety_badge: str | None = "실제 인물/IP 미사용 확인"
+    max_romance_level: str | None = "low"
+    no_real_person_reference: bool | None = True
+    no_external_contact: bool | None = True
+    avoid_dependency_language: bool | None = True
+
+
 class AdminPlotValidationRequest(BaseModel):
     title: str = Field(default="")
     one_line_hook: str = Field(default="")
+    opening_scene: str = Field(default="")
+    member_role: str = Field(default="")
+    relationship_frame: str = Field(default="")
+    choice_labels: list[str] = Field(default_factory=list)
+    safe_summary_template: str = Field(default="")
+
+
+class AdminPlotCardCreateRequest(BaseModel):
+    id: str | None = None
+    title: str
+    member_id: str
+    member_role: str
+    one_line_hook: str
+    relationship_frame: str
+    estimated_time: str
+    quest_type: str
+    tags: list[str]
+    opening_scene: str
+    choices: list[PlotChoicePayload]
+    completion_reward: CompletionRewardPayload
+    safety: PlotSafetyPayload = Field(default_factory=PlotSafetyPayload)
+    status: str = Field(default="draft")
+    approval_status: str = Field(default="pending")
+    sort_order: int | None = None
+
+
+class AdminPlotCardUpdateRequest(BaseModel):
+    title: str | None = None
+    member_id: str | None = None
+    member_role: str | None = None
+    one_line_hook: str | None = None
+    relationship_frame: str | None = None
+    estimated_time: str | None = None
+    quest_type: str | None = None
+    tags: list[str] | None = None
+    opening_scene: str | None = None
+    choices: list[PlotChoicePayload] | None = None
+    completion_reward: CompletionRewardPayload | None = None
+    safety: PlotSafetyPayload | None = None
+    status: str | None = None
+    approval_status: str | None = None
+    sort_order: int | None = None
+
+
+class AdminSafetyTemplateCreateRequest(BaseModel):
+    id: str | None = None
+    name: str
+    category: str
+    template: str
+    guidance: str = Field(default="")
+    status: str = Field(default="draft")
+    approval_status: str = Field(default="pending")
+
+
+class AdminSafetyTemplateUpdateRequest(BaseModel):
+    name: str | None = None
+    category: str | None = None
+    template: str | None = None
+    guidance: str | None = None
+    status: str | None = None
+    approval_status: str | None = None
 
 
 
@@ -76,7 +158,7 @@ def create_app(db_path: str | None = None, llm_client: LlmClient | None = None) 
 
     @app.get("/api/plot-cards")
     def list_plot_cards() -> dict[str, object]:
-        return {"plot_cards": PLOT_CARDS}
+        return {"plot_cards": repo.list_plot_cards()}
 
     @app.post("/api/profiles", status_code=201)
     def create_profile(request: ProfileCreateRequest) -> dict[str, object]:
@@ -111,8 +193,8 @@ def create_app(db_path: str | None = None, llm_client: LlmClient | None = None) 
         recent_logbook = repo.list_recent_logbook_entries_for_profile(profile_id)
         return {
             "profile": profile,
-            "continue_session": continue_summary(session),
-            "active_quest": active_quest_summary(session),
+            "continue_session": continue_summary(repo, session),
+            "active_quest": active_quest_summary(repo, session),
             "relationship_summary": relationship_summary(session),
             "safety_preferences": profile["safety_preferences"],
             "recent_logbook": recent_logbook,
@@ -146,7 +228,7 @@ def create_app(db_path: str | None = None, llm_client: LlmClient | None = None) 
         if request.session_id is None:
             if request.plot_id is None:
                 raise HTTPException(status_code=400, detail="plot_id is required to start a session")
-            card = find_plot(request.plot_id)
+            card = repo.get_plot_card(request.plot_id)
             if card is None:
                 raise HTTPException(status_code=404, detail="plot not found")
             session = repo.create_session(request.plot_id, request.profile_id)
@@ -157,7 +239,7 @@ def create_app(db_path: str | None = None, llm_client: LlmClient | None = None) 
             raise HTTPException(status_code=404, detail="session not found")
         if request.profile_id is not None:
             session["profile_id"] = request.profile_id
-        card = find_plot(session["plot_id"])
+        card = repo.get_plot_card(str(session["plot_id"]), include_disabled=True, admin=True)
         if card is None:
             raise HTTPException(status_code=404, detail="plot not found")
 
@@ -203,7 +285,99 @@ def create_app(db_path: str | None = None, llm_client: LlmClient | None = None) 
 
     @app.post("/api/admin/plot-cards/validate")
     def validate_plot_card(request: AdminPlotValidationRequest) -> dict[str, object]:
-        return validate_operator_content(request.title, request.one_line_hook)
+        return validate_operator_content(
+            request.title,
+            request.one_line_hook,
+            request.opening_scene,
+            request.member_role,
+            request.relationship_frame,
+            *request.choice_labels,
+            request.safe_summary_template,
+        )
+
+    @app.get("/api/admin/plot-cards")
+    def list_admin_plot_cards(include_disabled: bool = True) -> dict[str, object]:
+        return {"plot_cards": repo.list_plot_cards(include_disabled=include_disabled, admin=True)}
+
+    @app.get("/api/admin/plot-cards/{plot_id}")
+    def get_admin_plot_card(plot_id: str) -> dict[str, object]:
+        card = repo.get_plot_card(plot_id, include_disabled=True, admin=True)
+        if card is None:
+            raise HTTPException(status_code=404, detail="plot card not found")
+        return {"plot_card": card}
+
+    @app.post("/api/admin/plot-cards", status_code=201)
+    def create_admin_plot_card(request: AdminPlotCardCreateRequest) -> dict[str, object]:
+        validation = validate_plot_payload(request)
+        ensure_safe_to_save(validation)
+        plot_payload = plot_request_payload(request)
+        if plot_payload["id"] is None:
+            plot_payload["id"] = slugify_identifier("p_operator_", request.title)
+        if repo.get_plot_card(plot_payload["id"], include_disabled=True, admin=True) is not None:
+            raise HTTPException(status_code=409, detail="plot card id already exists")
+        card = repo.create_plot_card(plot_payload)
+        return {"plot_card": card, "validation": validation}
+
+    @app.patch("/api/admin/plot-cards/{plot_id}")
+    def update_admin_plot_card(plot_id: str, request: AdminPlotCardUpdateRequest) -> dict[str, object]:
+        current = repo.get_plot_card(plot_id, include_disabled=True, admin=True)
+        if current is None:
+            raise HTTPException(status_code=404, detail="plot card not found")
+        merged = merge_plot_update(current, request)
+        validation = validate_plot_data(merged)
+        ensure_safe_to_save(validation)
+        card = repo.update_plot_card(plot_id, merged)
+        return {"plot_card": card, "validation": validation}
+
+    @app.post("/api/admin/plot-cards/{plot_id}/disable")
+    def disable_admin_plot_card(plot_id: str) -> dict[str, object]:
+        card = repo.disable_plot_card(plot_id)
+        if card is None:
+            raise HTTPException(status_code=404, detail="plot card not found")
+        return {"plot_card": card}
+
+    @app.get("/api/admin/safety-templates")
+    def list_admin_safety_templates(include_disabled: bool = True) -> dict[str, object]:
+        return {"safety_templates": repo.list_safety_templates(include_disabled=include_disabled)}
+
+    @app.get("/api/admin/safety-templates/{template_id}")
+    def get_admin_safety_template(template_id: str) -> dict[str, object]:
+        template = repo.get_safety_template(template_id)
+        if template is None:
+            raise HTTPException(status_code=404, detail="safety template not found")
+        return {"safety_template": template}
+
+    @app.post("/api/admin/safety-templates", status_code=201)
+    def create_admin_safety_template(request: AdminSafetyTemplateCreateRequest) -> dict[str, object]:
+        payload = safety_template_request_payload(request)
+        validation = validate_safety_template_data(payload)
+        ensure_safe_to_save(validation)
+        if payload["id"] is None:
+            payload["id"] = slugify_identifier("st_", request.name)
+        payload["validation"] = validation
+        if repo.get_safety_template(payload["id"]) is not None:
+            raise HTTPException(status_code=409, detail="safety template id already exists")
+        template = repo.create_safety_template(payload)
+        return {"safety_template": template, "validation": validation}
+
+    @app.patch("/api/admin/safety-templates/{template_id}")
+    def update_admin_safety_template(template_id: str, request: AdminSafetyTemplateUpdateRequest) -> dict[str, object]:
+        current = repo.get_safety_template(template_id)
+        if current is None:
+            raise HTTPException(status_code=404, detail="safety template not found")
+        merged = merge_safety_template_update(current, request)
+        validation = validate_safety_template_data(merged)
+        ensure_safe_to_save(validation)
+        merged["validation"] = validation
+        template = repo.update_safety_template(template_id, merged)
+        return {"safety_template": template, "validation": validation}
+
+    @app.post("/api/admin/safety-templates/{template_id}/disable")
+    def disable_admin_safety_template(template_id: str) -> dict[str, object]:
+        template = repo.disable_safety_template(template_id)
+        if template is None:
+            raise HTTPException(status_code=404, detail="safety template not found")
+        return {"safety_template": template}
 
     return app
 
@@ -230,11 +404,11 @@ def relationship_summary(session: dict[str, Any] | None) -> str | None:
     return str(session["relationship"]["display_summary"])
 
 
-def continue_summary(session: dict[str, Any] | None) -> dict[str, object] | None:
 
+def continue_summary(repo: Repository, session: dict[str, Any] | None) -> dict[str, object] | None:
     if session is None:
         return None
-    card = find_plot(str(session["plot_id"]))
+    card = repo.get_plot_card(str(session["plot_id"]), include_disabled=True, admin=True)
     return {
         "session_id": session["id"],
         "plot_id": session["plot_id"],
@@ -247,10 +421,10 @@ def continue_summary(session: dict[str, Any] | None) -> dict[str, object] | None
 
 
 
-def active_quest_summary(session: dict[str, Any] | None) -> dict[str, object] | None:
+def active_quest_summary(repo: Repository, session: dict[str, Any] | None) -> dict[str, object] | None:
     if session is None:
         return None
-    card = find_plot(str(session["plot_id"]))
+    card = repo.get_plot_card(str(session["plot_id"]), include_disabled=True, admin=True)
     return {
         "plot_id": session["plot_id"],
         "title": None if card is None else card["title"],
@@ -327,6 +501,80 @@ def maybe_generate_llm_reply(
         )
     except Exception:
         return fallback_message, "scripted_fallback"
+
+
+
+def validate_plot_payload(request: AdminPlotCardCreateRequest) -> dict[str, object]:
+    return validate_plot_data(plot_request_payload(request))
+
+
+
+def validate_plot_data(data: dict[str, Any]) -> dict[str, object]:
+    return validate_operator_content(
+        data["title"],
+        data["one_line_hook"],
+        data["opening_scene"],
+        data["member_role"],
+        data["relationship_frame"],
+        *(choice["label"] for choice in data["choices"]),
+        data["completion_reward"]["safe_summary_template"],
+    )
+
+
+
+def validate_safety_template_data(data: dict[str, Any]) -> dict[str, object]:
+    return validate_operator_content(data["name"], data["category"], data["template"], data["guidance"])
+
+
+
+def ensure_safe_to_save(validation: dict[str, object]) -> None:
+    if validation["ok"]:
+        return
+    raise HTTPException(status_code=400, detail=validation)
+
+
+
+def plot_request_payload(request: AdminPlotCardCreateRequest) -> dict[str, Any]:
+    return {
+        "id": request.id,
+        "title": request.title,
+        "member_id": request.member_id,
+        "member_role": request.member_role,
+        "one_line_hook": request.one_line_hook,
+        "relationship_frame": request.relationship_frame,
+        "estimated_time": request.estimated_time,
+        "quest_type": request.quest_type,
+        "tags": request.tags,
+        "opening_scene": request.opening_scene,
+        "choices": [choice.model_dump() for choice in request.choices],
+        "completion_reward": request.completion_reward.model_dump(),
+        "safety": request.safety.model_dump(exclude_none=True),
+        "status": request.status,
+        "approval_status": request.approval_status,
+        "sort_order": request.sort_order,
+    }
+
+
+
+def merge_plot_update(current: dict[str, Any], request: AdminPlotCardUpdateRequest) -> dict[str, Any]:
+    merged = dict(current)
+    payload = request.model_dump(exclude_none=True)
+    if "safety" in payload:
+        merged["safety"] = {**merged["safety"], **payload.pop("safety")}
+    merged.update(payload)
+    return merged
+
+
+
+def safety_template_request_payload(request: AdminSafetyTemplateCreateRequest) -> dict[str, Any]:
+    return request.model_dump()
+
+
+
+def merge_safety_template_update(current: dict[str, Any], request: AdminSafetyTemplateUpdateRequest) -> dict[str, Any]:
+    merged = dict(current)
+    merged.update(request.model_dump(exclude_none=True))
+    return merged
 
 
 app = create_app()

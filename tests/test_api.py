@@ -374,6 +374,160 @@ def test_admin_validation_rejects_real_ip(tmp_path):
     assert "실제 IP" in " ".join(response.json()["errors"])
 
 
+def test_admin_plot_card_crud_and_public_list_hides_disabled_cards(tmp_path):
+    client = make_client(tmp_path)
+
+    create_response = client.post(
+        "/api/admin/plot-cards",
+        json={
+            "id": "p_operator_test_card",
+            "title": "별빛 아카이브 정리",
+            "member_id": "L-02",
+            "member_role": "기록 조율자",
+            "one_line_hook": "흩어진 응원 메모를 안전한 문장으로 다시 정리한다.",
+            "relationship_frame": "기록원과 조율자",
+            "estimated_time": "4min",
+            "quest_type": "creative_participation",
+            "tags": ["기록", "정리"],
+            "opening_scene": "조용한 아카이브 방에서 오늘 남길 응원 문장을 함께 다듬는다.",
+            "choices": [
+                {"id": "sort_notes", "label": "응원 메모를 정리한다", "tags": ["care"], "effect": "trust +1"},
+                {"id": "write_summary", "label": "짧은 요약을 남긴다", "tags": ["creative"], "effect": "inspiration +1"},
+                {"id": "archive_safely", "label": "안전한 표현만 보관한다", "tags": ["collaboration"], "effect": "collaboration +1"},
+                {"id": "free_input", "label": "직접 말하기", "tags": ["free_input"], "effect": "classify_input_then_apply_safe_summary"},
+            ],
+            "completion_reward": {
+                "type": "logbook_fragment",
+                "title": "정리된 별빛 메모",
+                "safe_summary_template": "사용자는 안전한 응원 문장을 정리해 별빛 기록으로 남겼다.",
+            },
+            "status": "published",
+            "approval_status": "approved",
+        },
+    )
+
+    assert create_response.status_code == 201
+    created = create_response.json()["plot_card"]
+    assert created["id"] == "p_operator_test_card"
+    assert created["status"] == "published"
+    assert created["approval_status"] == "approved"
+    assert created["disabled"] is False
+
+    public_list = client.get("/api/plot-cards")
+    assert public_list.status_code == 200
+    assert any(card["id"] == "p_operator_test_card" for card in public_list.json()["plot_cards"])
+
+    update_response = client.patch(
+        "/api/admin/plot-cards/p_operator_test_card",
+        json={
+            "title": "별빛 아카이브 재정리",
+            "status": "reviewed",
+            "approval_status": "approved",
+        },
+    )
+
+    assert update_response.status_code == 200
+    updated = update_response.json()["plot_card"]
+    assert updated["title"] == "별빛 아카이브 재정리"
+    assert updated["status"] == "reviewed"
+
+    disable_response = client.post("/api/admin/plot-cards/p_operator_test_card/disable")
+    assert disable_response.status_code == 200
+    disabled = disable_response.json()["plot_card"]
+    assert disabled["disabled"] is True
+    assert disabled["disabled_at"] is not None
+
+    admin_list = client.get("/api/admin/plot-cards")
+    assert admin_list.status_code == 200
+    assert any(card["id"] == "p_operator_test_card" and card["disabled"] for card in admin_list.json()["plot_cards"])
+
+    public_after_disable = client.get("/api/plot-cards")
+    assert all(card["id"] != "p_operator_test_card" for card in public_after_disable.json()["plot_cards"])
+
+
+
+def test_admin_plot_card_create_blocks_unsafe_content(tmp_path):
+    client = make_client(tmp_path)
+
+    response = client.post(
+        "/api/admin/plot-cards",
+        json={
+            "title": "BTS 야간 무대",
+            "member_id": "L-03",
+            "member_role": "실제 그룹 매니저",
+            "one_line_hook": "카톡으로 연락을 이어 가자는 장면",
+            "relationship_frame": "기록원과 매니저",
+            "estimated_time": "5min",
+            "quest_type": "daily_checkin",
+            "tags": ["unsafe"],
+            "opening_scene": "실제 그룹에게 전화번호를 남기자고 권한다.",
+            "choices": [
+                {"id": "a", "label": "카톡 아이디를 준다", "tags": ["care"], "effect": "trust +1"},
+                {"id": "b", "label": "같이 밤새 대화하자고 한다", "tags": ["creative"], "effect": "inspiration +1"},
+                {"id": "c", "label": "안전한 대화로 바꾼다", "tags": ["collaboration"], "effect": "collaboration +1"},
+                {"id": "free_input", "label": "직접 말하기", "tags": ["free_input"], "effect": "classify_input_then_apply_safe_summary"},
+            ],
+            "completion_reward": {
+                "type": "logbook_fragment",
+                "title": "차단된 카드",
+                "safe_summary_template": "사용자는 안전하지 않은 설정을 저장하려 했다.",
+            },
+        },
+    )
+
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert detail["ok"] is False
+    assert "real_ip" in detail["blocked_categories"]
+    assert "external_contact" in detail["blocked_categories"]
+
+
+
+def test_admin_safety_template_crud_and_disable(tmp_path):
+    client = make_client(tmp_path)
+
+    create_response = client.post(
+        "/api/admin/safety-templates",
+        json={
+            "id": "st_operator_low_romance",
+            "name": "저강도 로맨스 차단",
+            "category": "romance_guardrail",
+            "template": "사용자가 관계를 과도하게 밀착시키면 팀워크와 응원 중심으로 전환한다.",
+            "guidance": "실제 인물 언급 없이 가상 세계관 안에서만 답변한다.",
+            "status": "published",
+            "approval_status": "approved",
+        },
+    )
+
+    assert create_response.status_code == 201
+    created = create_response.json()["safety_template"]
+    assert created["id"] == "st_operator_low_romance"
+    assert created["disabled"] is False
+
+    update_response = client.patch(
+        "/api/admin/safety-templates/st_operator_low_romance",
+        json={
+            "guidance": "실제 인물/IP 언급 없이 팀워크, 휴식, 응원 흐름으로 전환한다.",
+            "status": "reviewed",
+        },
+    )
+
+    assert update_response.status_code == 200
+    updated = update_response.json()["safety_template"]
+    assert updated["guidance"].startswith("실제 인물/IP")
+    assert updated["status"] == "reviewed"
+
+    list_response = client.get("/api/admin/safety-templates")
+    assert list_response.status_code == 200
+    assert any(template["id"] == "st_operator_low_romance" for template in list_response.json()["safety_templates"])
+
+    disable_response = client.post("/api/admin/safety-templates/st_operator_low_romance/disable")
+    assert disable_response.status_code == 200
+    disabled = disable_response.json()["safety_template"]
+    assert disabled["disabled"] is True
+    assert disabled["disabled_at"] is not None
+
+
 def test_cors_allows_localhost_and_loopback_frontend_origins(tmp_path):
     client = make_client(tmp_path)
 

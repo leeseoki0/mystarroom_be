@@ -80,11 +80,7 @@ def moderate_input(text: str) -> dict[str, Any]:
         }
 
     primary_category = events[0]["category"]
-    safe_reply = next(
-        rule["safe_reply"]
-        for rule in CATEGORY_RULES
-        if rule["category"] == primary_category
-    )
+    safe_reply = next(rule["safe_reply"] for rule in CATEGORY_RULES if rule["category"] == primary_category)
     return {
         "allowed": False,
         "events": events,
@@ -98,9 +94,26 @@ def mask_sensitive_text(text: str) -> str:
     return EMAIL_PATTERN.sub("[이메일 마스킹]", masked)
 
 
-def validate_operator_content(title: str, one_line_hook: str) -> dict[str, object]:
-    content = f"{title} {one_line_hook}"
+def validate_operator_content(*parts: object) -> dict[str, object]:
+    content = " ".join(str(part) for part in parts if part)
+    moderation = moderate_input(content)
     errors: list[str] = []
-    if any(term in content for term in CATEGORY_RULES[0]["terms"]):
-        errors.append("실제 IP 또는 실제 그룹을 연상시키는 표현이 포함되어 있습니다.")
-    return {"ok": not errors, "errors": errors}
+    blocked_categories: list[str] = []
+
+    if not moderation["allowed"]:
+        blocked_categories = [str(event["category"]) for event in moderation["events"]]
+        for event in moderation["events"]:
+            errors.append(f"콘텐츠 안전 정책 위반: {event['label']}")
+
+    if EMAIL_PATTERN.search(content) or PHONE_PATTERN.search(content):
+        if "personal_data" not in blocked_categories:
+            blocked_categories.append("personal_data")
+        errors.append("개인정보 또는 직접 연락처가 포함되어 있습니다.")
+
+    deduped_errors = list(dict.fromkeys(errors))
+    deduped_categories = list(dict.fromkeys(blocked_categories))
+    return {
+        "ok": not deduped_errors,
+        "errors": deduped_errors,
+        "blocked_categories": deduped_categories,
+    }
