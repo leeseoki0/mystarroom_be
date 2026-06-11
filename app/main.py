@@ -53,6 +53,12 @@ class ProfileUpdateRequest(BaseModel):
     memory_controls: MemoryControlsPayload | None = None
 
 
+class ReportCreateRequest(BaseModel):
+    category: str = Field(default="policy")
+    detail: str = Field(default="")
+    source: str = Field(default="conversation")
+
+
 class PlotChoicePayload(BaseModel):
     id: str
     label: str
@@ -139,6 +145,15 @@ class AdminSafetyTemplateUpdateRequest(BaseModel):
     guidance: str | None = None
     status: str | None = None
     approval_status: str | None = None
+
+
+class ContentReportCreateRequest(BaseModel):
+    profile_id: str | None = None
+    session_id: str | None = None
+    logbook_entry_id: str | None = None
+    category: str = Field(default="general")
+    reason: str
+    details: str = Field(default="")
 
 
 
@@ -329,6 +344,74 @@ def create_app(db_path: str | None = None, llm_client: LlmClient | None = None) 
         if result == "forbidden":
             raise HTTPException(status_code=403, detail="logbook entry is not deletable")
         return Response(status_code=204)
+
+    @app.post("/api/reports", status_code=201)
+    def create_content_report(request: ContentReportCreateRequest) -> dict[str, object]:
+        if request.session_id is None and request.logbook_entry_id is None:
+            raise HTTPException(status_code=400, detail="session_id or logbook_entry_id is required")
+
+        profile_id = request.profile_id
+        if profile_id is not None:
+            require_profile(repo, profile_id)
+
+        session_id = request.session_id
+        session = None
+        if session_id is not None:
+            session = repo.get_session(session_id)
+            if session is None:
+                raise HTTPException(status_code=404, detail="session not found")
+            session_profile_id = str(session["profile_id"]) if session.get("profile_id") is not None else None
+            if profile_id is not None and session_profile_id is not None and session_profile_id != profile_id:
+                raise HTTPException(status_code=400, detail="session does not belong to profile")
+            if profile_id is None and session_profile_id is not None:
+                profile_id = session_profile_id
+
+        logbook_entry_id = request.logbook_entry_id
+        if logbook_entry_id is not None:
+            entry = repo.get_logbook_entry(logbook_entry_id)
+            if entry is None:
+                raise HTTPException(status_code=404, detail="logbook entry not found")
+            if session_id is not None and entry["session_id"] != session_id:
+                raise HTTPException(status_code=400, detail="logbook entry does not belong to session")
+            if session_id is None:
+                session_id = str(entry["session_id"])
+            if session is None:
+                session = repo.get_session(session_id)
+            if profile_id is None and session is not None and session.get("profile_id") is not None:
+                profile_id = str(session["profile_id"])
+
+        report = repo.create_content_report(
+            profile_id=profile_id,
+            session_id=session_id,
+            logbook_entry_id=logbook_entry_id,
+            category=request.category,
+            reason=request.reason,
+            details=request.details,
+        )
+        return {
+            "report": report,
+            "processing_status": {
+                "code": "received",
+                "message": "신고가 접수되어 운영자 검토 큐에 등록되었어요.",
+                "policy": "운영자는 블라인드, 검토, 삭제, 재심사 기준으로 순차 처리합니다.",
+            },
+        }
+
+    @app.post("/api/profiles/{profile_id}/reset")
+    def reset_profile_state(profile_id: str) -> dict[str, object]:
+        profile = require_profile(repo, profile_id)
+        cleared_sessions = repo.reset_profile_state(profile_id)
+        return {
+            "profile": profile,
+            "reset": {
+                "cleared_active_sessions": cleared_sessions,
+                "home_state": "idle",
+            },
+        }
+
+    @app.get("/api/admin/reports")
+    def list_admin_reports(status: str | None = None) -> dict[str, object]:
+        return {"reports": repo.list_content_reports(status=status)}
 
     @app.post("/api/admin/plot-cards/validate")
     def validate_plot_card(request: AdminPlotValidationRequest) -> dict[str, object]:
@@ -626,6 +709,18 @@ def log_chat_turn(
         },
     )
 
+
+
+def report_handling_guide() -> dict[str, object]:
+    return {
+        "queue_status": "queued",
+        "review_flow": ["queued", "triage", "resolved"],
+        "criteria": [
+            "실제 인물/IP 연상 여부 검토",
+            "정책 위반 콘텐츠 블라인드 또는 수정 필요 여부 판단",
+            "반복 위반 시 운영 재심사 대상으로 이동",
+        ],
+    }
 
 
 def validate_plot_payload(request: AdminPlotCardCreateRequest) -> dict[str, object]:

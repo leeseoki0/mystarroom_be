@@ -123,6 +123,36 @@ class Repository:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS reports (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    profile_id TEXT,
+                    category TEXT NOT NULL,
+                    detail TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(session_id) REFERENCES sessions(id),
+                    FOREIGN KEY(profile_id) REFERENCES profiles(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS content_reports (
+                    id TEXT PRIMARY KEY,
+                    profile_id TEXT,
+                    session_id TEXT,
+                    logbook_entry_id TEXT,
+                    category TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    details TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(profile_id) REFERENCES profiles(id),
+                    FOREIGN KEY(session_id) REFERENCES sessions(id),
+                    FOREIGN KEY(logbook_entry_id) REFERENCES logbook_entries(id)
+                );
                 """
             )
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()}
@@ -497,6 +527,48 @@ class Repository:
             return None
         return row_to_session(row)
 
+    def reset_session(self, session_id: str) -> dict[str, Any] | None:
+        session = self.get_session(session_id)
+        if session is None:
+            return None
+        deleted_at = utc_now()
+        with self.connect() as conn:
+            deleted_logbook_entries = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM logbook_entries
+                WHERE session_id = ? AND deleted_at IS NULL
+                """,
+                (session_id,),
+            ).fetchone()["count"]
+            conn.execute(
+                """
+                UPDATE logbook_entries
+                SET deleted_at = COALESCE(deleted_at, ?)
+                WHERE session_id = ?
+                """,
+                (deleted_at, session_id),
+            )
+        session["completed"] = True
+        session["step"] = 1
+        session["relationship"] = {
+            "trust": 0,
+            "inspiration": 0,
+            "collaboration": 0,
+            "support_balance": 0,
+            "display_summary": "리셋되어 새 장면을 시작할 수 있어요.",
+        }
+        cleared_safety_events = len(session["safety_events"])
+        session["safety_events"] = []
+        self.update_session(session)
+        return {
+            "session": session,
+            "cleared": {
+                "logbook_entries": int(deleted_logbook_entries),
+                "safety_events": cleared_safety_events,
+            },
+        }
+
     def update_session(self, session: dict[str, Any]) -> None:
         session["updated_at"] = utc_now()
         with self.connect() as conn:
@@ -628,6 +700,92 @@ class Repository:
                 (session_id, limit),
             ).fetchall()
         return [str(row["summary"]) for row in rows]
+
+    def get_logbook_entry(self, entry_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM logbook_entries WHERE id = ?", (entry_id,)).fetchone()
+        if row is None:
+            return None
+        return row_to_logbook_entry(row)
+
+    def reset_profile_state(self, profile_id: str) -> int:
+        now = utc_now()
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT id FROM sessions WHERE profile_id = ? AND completed = 0",
+                (profile_id,),
+            ).fetchall()
+            conn.execute(
+                """
+                UPDATE sessions
+                SET completed = 1, updated_at = ?
+                WHERE profile_id = ? AND completed = 0
+                """,
+                (now, profile_id),
+            )
+        return len(rows)
+
+    def create_content_report(
+        self,
+        *,
+        profile_id: str | None,
+        session_id: str | None,
+        logbook_entry_id: str | None,
+        category: str,
+        reason: str,
+        details: str = "",
+    ) -> dict[str, Any]:
+        report = {
+            "id": f"rpt_{uuid.uuid4().hex[:12]}",
+            "profile_id": profile_id,
+            "session_id": session_id,
+            "logbook_entry_id": logbook_entry_id,
+            "category": category,
+            "reason": reason,
+            "details": details,
+            "status": "received",
+            "created_at": utc_now(),
+            "updated_at": utc_now(),
+        }
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO content_reports (
+                    id, profile_id, session_id, logbook_entry_id, category, reason, details, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    report["id"],
+                    report["profile_id"],
+                    report["session_id"],
+                    report["logbook_entry_id"],
+                    report["category"],
+                    report["reason"],
+                    report["details"],
+                    report["status"],
+                    report["created_at"],
+                    report["updated_at"],
+                ),
+            )
+        return report
+
+    def list_content_reports(self, status: str | None = None) -> list[dict[str, Any]]:
+        where_sql = ""
+        params: tuple[Any, ...] = ()
+        if status is not None:
+            where_sql = "WHERE status = ?"
+            params = (status,)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM content_reports
+                {where_sql}
+                ORDER BY created_at DESC
+                """,
+                params,
+            ).fetchall()
+        return [row_to_content_report(row) for row in rows]
 
 
 def merge_dict(base: dict[str, Any], update: dict[str, Any] | None) -> dict[str, Any]:
@@ -832,6 +990,35 @@ def row_to_safety_template(row: sqlite3.Row) -> dict[str, Any]:
         "disabled_at": row["disabled_at"],
         "source": row["source"],
         "validation": json.loads(row["validation"]),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def row_to_content_report(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "profile_id": row["profile_id"],
+        "session_id": row["session_id"],
+        "logbook_entry_id": row["logbook_entry_id"],
+        "category": row["category"],
+        "reason": row["reason"],
+        "details": row["details"],
+        "status": row["status"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def row_to_report(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "session_id": row["session_id"],
+        "profile_id": row["profile_id"],
+        "category": row["category"],
+        "detail": row["detail"],
+        "source": row["source"],
+        "status": row["status"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }

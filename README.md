@@ -8,7 +8,8 @@ FastAPI + SQLite backend for the Mystarroom / Luminote AI fan service MVP.
 - Guest profile onboarding/profile API with support style, safety preferences, and memory controls
 - Home/continue APIs for active quest, relationship summary, and recent logbook entries
 - Chat turn API for plot start, guided choices, and free input
-- SQLite-backed profile, session, and logbook persistence
+- Report intake/admin queue API plus profile reset for post-incident recovery
+- SQLite-backed profile, session, logbook, and report persistence
 - Safety checks for real IP references, external contact/private info, and overdependence patterns
 - Optional OpenAI-compatible LLM provider for LM Studio or similar servers, with scripted fallback
 - Operator plot-card validation endpoint
@@ -56,6 +57,23 @@ The frontend still calls only this FastAPI backend; never expose the LLM server 
 pytest -q
 ```
 
+Targeted API smoke check:
+
+```bash
+PYTHONPATH=. python3 - <<'PY'
+from fastapi.testclient import TestClient
+
+from app.main import create_app
+
+client = TestClient(create_app(db_path='data/smoke.sqlite3'))
+profile_id = client.post('/api/profiles', json={}).json()['profile']['id']
+session_id = client.post('/api/chat/turn', json={'profile_id': profile_id, 'plot_id': 'p_luminote_001_first_light'}).json()['session']['id']
+client.post(f'/api/sessions/{session_id}/report', json={'category': 'policy', 'detail': 'smoke'})
+client.post(f'/api/sessions/{session_id}/reset')
+print(client.get(f'/api/profiles/{profile_id}/home').json())
+PY
+```
+
 ## API
 
 - `GET /api/health`
@@ -65,8 +83,11 @@ pytest -q
 - `PATCH /api/profiles/{profile_id}`
 - `GET /api/profiles/{profile_id}/home`
 - `GET /api/profiles/{profile_id}/continue`
+- `POST /api/profiles/{profile_id}/reset`
 - `POST /api/chat/turn`
 - `GET /api/sessions/{session_id}/logbook`
+- `POST /api/reports`
+- `GET /api/admin/reports`
 - `POST /api/admin/plot-cards/validate`
 
 SQLite data is stored under `data/luminote.sqlite3` by default and is ignored by git.

@@ -478,10 +478,103 @@ def test_chat_turn_logs_operational_metadata(tmp_path, caplog):
     assert record.fallback_reason is None
     assert isinstance(record.latency_ms, int)
     assert record.latency_ms >= 0
+    assert record.llm_attempts == 1
     assert record.safety_event_count == 0
     assert record.policy_version == "response-format-v1"
     assert record.model_version == "fake-llm-v1"
-    assert record.llm_attempts == 1
+
+
+def test_report_and_reset_flow_updates_home_and_admin_queue(tmp_path):
+    client = make_client(tmp_path)
+    profile = create_profile(client)
+    profile_id = profile["id"]
+
+    session_id = client.post(
+        "/api/chat/turn",
+        json={"profile_id": profile_id, "plot_id": "p_luminote_001_first_light"},
+    ).json()["session"]["id"]
+
+    choice_response = client.post(
+        "/api/chat/turn",
+        json={"session_id": session_id, "choice_id": "choose_gold_light"},
+    )
+    assert choice_response.status_code == 200
+
+    free_input_response = client.post(
+        "/api/chat/turn",
+        json={"session_id": session_id, "free_input": "응원 문장을 조금 더 다정하게 바꾸고 싶어"},
+    )
+    assert free_input_response.status_code == 200
+
+    logbook_entries = client.get(f"/api/sessions/{session_id}/logbook").json()["entries"]
+    assert len(logbook_entries) == 2
+    deleted_entry_id = logbook_entries[0]["id"]
+
+    deleted = client.delete(f"/api/sessions/{session_id}/logbook/{deleted_entry_id}")
+    assert deleted.status_code == 204
+
+    report_response = client.post(
+        "/api/reports",
+        json={
+            "profile_id": profile_id,
+            "session_id": session_id,
+            "category": "rights_concern",
+            "reason": "권리 침해 의심 장면 검토 요청",
+            "details": "운영자 큐에서 확인해주세요.",
+        },
+    )
+    assert report_response.status_code == 201
+    report_body = report_response.json()
+    assert report_body["processing_status"]["code"] == "received"
+    assert report_body["report"]["profile_id"] == profile_id
+    assert report_body["report"]["session_id"] == session_id
+    assert report_body["report"]["status"] == "received"
+
+    admin_reports = client.get("/api/admin/reports")
+    assert admin_reports.status_code == 200
+    assert admin_reports.json()["reports"][0]["id"] == report_body["report"]["id"]
+
+    reset_response = client.post(f"/api/profiles/{profile_id}/reset")
+    assert reset_response.status_code == 200
+    assert reset_response.json()["reset"]["cleared_active_sessions"] == 1
+    assert reset_response.json()["reset"]["home_state"] == "idle"
+
+    home_response = client.get(f"/api/profiles/{profile_id}/home")
+    assert home_response.status_code == 200
+    home = home_response.json()
+    assert home["profile"]["id"] == profile_id
+    assert home["continue_session"] is None
+    assert home["active_quest"] is None
+    assert home["relationship_summary"] is None
+    assert len(home["recent_logbook"]) == 1
+    assert home["recent_logbook"][0]["id"] != deleted_entry_id
+
+    continue_response = client.get(f"/api/profiles/{profile_id}/continue")
+    assert continue_response.status_code == 200
+    assert continue_response.json()["session"] is None
+
+
+def test_report_rejects_session_profile_mismatch(tmp_path):
+    client = make_client(tmp_path)
+    owner = create_profile(client)
+    other = create_profile(client)
+
+    session_id = client.post(
+        "/api/chat/turn",
+        json={"profile_id": owner["id"], "plot_id": "p_luminote_001_first_light"},
+    ).json()["session"]["id"]
+
+    response = client.post(
+        "/api/reports",
+        json={
+            "profile_id": other["id"],
+            "session_id": session_id,
+            "reason": "다른 프로필로 잘못 신고 요청",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "session does not belong to profile"
 
 
 def test_admin_validation_rejects_real_ip(tmp_path):
