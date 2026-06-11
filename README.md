@@ -68,8 +68,18 @@ from app.main import create_app
 client = TestClient(create_app(db_path='data/smoke.sqlite3'))
 profile_id = client.post('/api/profiles', json={}).json()['profile']['id']
 session_id = client.post('/api/chat/turn', json={'profile_id': profile_id, 'plot_id': 'p_luminote_001_first_light'}).json()['session']['id']
-client.post(f'/api/sessions/{session_id}/report', json={'category': 'policy', 'detail': 'smoke'})
-client.post(f'/api/sessions/{session_id}/reset')
+report = client.post(
+    '/api/reports',
+    json={
+        'profile_id': profile_id,
+        'session_id': session_id,
+        'category': 'policy',
+        'reason': 'smoke',
+    },
+).json()
+reset = client.post(f'/api/profiles/{profile_id}/reset').json()
+print(report['processing_status']['code'])
+print(reset['reset'])
 print(client.get(f'/api/profiles/{profile_id}/home').json())
 PY
 ```
