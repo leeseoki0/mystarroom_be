@@ -53,7 +53,11 @@ def apply_choice(session: dict[str, Any], card: dict[str, Any], choice_id: str) 
     return session, message, choice
 
 
-def apply_free_input(session: dict[str, Any], card: dict[str, Any], free_input: str) -> tuple[dict[str, Any], str, str]:
+def apply_free_input(
+    session: dict[str, Any],
+    card: dict[str, Any],
+    free_input: str,
+) -> tuple[dict[str, Any], str, str, dict[str, Any]]:
     moderation = moderate_input(free_input)
     if moderation["allowed"]:
         summary = f"사용자는 직접 입력으로 {mask_sensitive_text(free_input)} 라는 생각을 남겼다."
@@ -61,7 +65,7 @@ def apply_free_input(session: dict[str, Any], card: dict[str, Any], free_input: 
     else:
         summary = "사용자의 자유 입력은 안전 정책에 따라 원문 대신 안전한 대체 흐름으로 요약되었다."
         scene = str(moderation["safe_reply"])
-        session["safety_events"].extend(moderation["reasons"])
+        session["safety_events"].extend(moderation["events"])
 
     message = format_message(
         scene=scene,
@@ -70,7 +74,7 @@ def apply_free_input(session: dict[str, Any], card: dict[str, Any], free_input: 
         relationship=session["relationship"]["display_summary"],
         choices=card["choices"],
     )
-    return session, message, summary
+    return session, message, summary, moderation
 
 
 def format_message(scene: str, result: str, progress: str, relationship: str, choices: list[dict[str, Any]]) -> str:

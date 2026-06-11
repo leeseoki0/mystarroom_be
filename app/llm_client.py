@@ -22,7 +22,7 @@ class LlmContext:
     scene: str
     user_action: str
     relationship_summary: str
-    safety_events: list[str]
+    safety_events: list[dict[str, str]]
     recent_memories: list[str]
 
 
@@ -90,7 +90,14 @@ def build_system_prompt() -> str:
 
 
 def build_user_prompt(context: LlmContext) -> str:
-    safety = ", ".join(context.safety_events) if context.safety_events else "없음"
+    safety = (
+        " | ".join(
+            f"{event['category']}:{event['action']}"
+            for event in context.safety_events
+        )
+        if context.safety_events
+        else "없음"
+    )
     memories = " | ".join(context.recent_memories) if context.recent_memories else "없음"
     return (
         f"플롯: {context.plot_title}\n"

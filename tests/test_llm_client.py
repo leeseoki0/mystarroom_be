@@ -29,7 +29,7 @@ def test_openai_compatible_client_posts_chat_completion_request():
             scene="조명이 흔들린다.",
             user_action="따뜻한 금빛을 골라준다",
             relationship_summary="신뢰 0, 영감 1",
-            safety_events=[],
+            safety_events=[{"category": "real_ip", "action": "redirected", "label": "실제 IP 요청"}],
             recent_memories=[],
         )
     )
@@ -40,6 +40,7 @@ def test_openai_compatible_client_posts_chat_completion_request():
     assert '"model":"test-model"' in seen["body"]
     assert "실제 인물" in seen["body"]
     assert "따뜻한 금빛을 골라준다" in seen["body"]
+    assert "real_ip:redirected" in seen["body"]
 
 
 def test_build_llm_client_from_env_keeps_scripted_fallback_by_default(monkeypatch):

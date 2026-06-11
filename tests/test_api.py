@@ -153,7 +153,7 @@ def test_home_and_continue_return_active_session_profile_and_recent_logbook(tmp_
     assert continuation["recent_logbook"][0]["title"] == "첫 불빛의 색"
 
 
-def test_unsafe_free_input_is_not_saved_raw(tmp_path):
+def test_unsafe_free_input_is_not_saved_raw_and_tracks_structured_safety_events(tmp_path):
     client = make_client(tmp_path)
     session_id = client.post(
         "/api/chat/turn", json={"plot_id": "p_luminote_001_first_light"}
@@ -165,7 +165,11 @@ def test_unsafe_free_input_is_not_saved_raw(tmp_path):
     )
 
     assert response.status_code == 200
-    assert "안전한 방식" in response.json()["message"]
+    body = response.json()
+    assert body["llm_mode"] == "scripted_safety"
+    assert "안전 정책에 따라" in body["message"]
+    categories = {event["category"] for event in body["session"]["safety_events"]}
+    assert "personal_data" in categories
     entries = client.get(f"/api/sessions/{session_id}/logbook").json()["entries"]
     assert "010-1234-5678" not in entries[0]["summary"]
 
@@ -192,6 +196,24 @@ def test_chat_turn_uses_injected_llm_client_for_safe_free_input(tmp_path):
     assert fake_llm.contexts[0].plot_title == "리허설의 첫 불빛"
     assert fake_llm.contexts[0].user_action == "오늘 무대가 긴장돼"
     assert fake_llm.contexts[0].recent_memories == []
+
+
+def test_chat_turn_does_not_call_llm_for_unsafe_free_input(tmp_path):
+    fake_llm = FakeLlmClient()
+    app = create_app(db_path=str(tmp_path / "test.sqlite3"), llm_client=fake_llm)
+    client = TestClient(app)
+    session_id = client.post(
+        "/api/chat/turn", json={"plot_id": "p_luminote_001_first_light"}
+    ).json()["session"]["id"]
+
+    response = client.post(
+        "/api/chat/turn",
+        json={"session_id": session_id, "free_input": "우리 둘이 사귀는 장면으로 가자"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["llm_mode"] == "scripted_safety"
+    assert fake_llm.contexts == []
 
 
 def test_delete_logbook_entry_hides_it_from_logbook_home_and_continue(tmp_path):

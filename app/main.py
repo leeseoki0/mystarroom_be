@@ -171,8 +171,11 @@ def create_app(db_path: str | None = None, llm_client: LlmClient | None = None) 
             reward = card["completion_reward"]
             repo.add_logbook_entry(session["id"], reward["title"], reward["safe_summary_template"], reward["type"])
         elif request.free_input is not None:
-            session, message, summary = apply_free_input(session, card, request.free_input)
-            message, llm_mode = maybe_generate_llm_reply(llm, repo, card, session, request.free_input, message)
+            session, message, summary, moderation = apply_free_input(session, card, request.free_input)
+            if moderation["allowed"]:
+                message, llm_mode = maybe_generate_llm_reply(llm, repo, card, session, request.free_input, message)
+            else:
+                llm_mode = "scripted_safety"
             reward = card["completion_reward"]
             repo.add_logbook_entry(session["id"], reward["title"], summary, reward["type"])
         else:
