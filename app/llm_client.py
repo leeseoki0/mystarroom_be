@@ -24,10 +24,14 @@ class LlmContext:
     relationship_summary: str
     safety_events: list[dict[str, str]]
     recent_memories: list[str]
+    choice_labels: list[str]
 
 
 class LlmClient(Protocol):
     def generate_reply(self, context: LlmContext) -> str:
+        ...
+
+    def model_version(self) -> str | None:
         ...
 
 
@@ -63,6 +67,9 @@ class OpenAICompatibleLlmClient:
         content = data["choices"][0]["message"]["content"]
         return str(content).strip()
 
+    def model_version(self) -> str | None:
+        return self.model
+
 
 def build_llm_client_from_env() -> LlmClient | None:
     provider = os.getenv("LLM_PROVIDER", "scripted").strip().lower()
@@ -84,8 +91,9 @@ def build_system_prompt() -> str:
         "너는 '루미노트'라는 완전 가상 아이돌 팬서비스의 안전한 캐릭터 응답 엔진이다. "
         "실제 인물, 실제 아이돌 그룹, 실제 IP를 언급하거나 흉내 내지 않는다. "
         "사용자를 과몰입시키는 독점적 관계 표현, 외부 연락처 요구, 개인정보 저장 요청은 피한다. "
-        "한국어로 3~6문장 정도의 따뜻한 장면 응답을 작성한다. "
-        "공식 플롯 맥락과 관계 요약을 유지하고, 선택지 결과처럼 자연스럽게 반응한다."
+        "공식 플롯 맥락과 관계 요약을 유지하고, 선택지 결과처럼 자연스럽게 반응한다. "
+        "반드시 아래 섹션 제목을 그대로 포함한 응답만 작성한다: [장면], [선택 결과], [진행], [다음 선택]. "
+        "[다음 선택]에는 A, B, C, D 네 줄을 그대로 유지한다. 다른 머리말이나 설명은 덧붙이지 않는다."
     )
 
 
@@ -107,5 +115,13 @@ def build_user_prompt(context: LlmContext) -> str:
         f"관계 요약: {context.relationship_summary}\n"
         f"최근 기억 조각: {memories}\n"
         f"안전 이벤트: {safety}\n\n"
-        "위 정보를 바탕으로 팬서비스 챗봇의 다음 응답만 작성해줘."
+        "반드시 아래 형식만 사용해 응답해줘.\n"
+        "[장면]\n(2~3문장 장면 묘사)\n\n"
+        "[선택 결과]\n(사용자 입력이 반영된 안전한 결과 1~2문장)\n\n"
+        "[진행]\n(퀘스트 진행 1문장)\n(관계 변화 1문장)\n\n"
+        "[다음 선택]\n"
+        f"A. {context.choice_labels[0]}\n"
+        f"B. {context.choice_labels[1]}\n"
+        f"C. {context.choice_labels[2]}\n"
+        "D. 직접 말하기"
     )

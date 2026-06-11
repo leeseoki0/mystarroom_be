@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
+from time import perf_counter
 from typing import Any
+from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,6 +14,11 @@ from .chatbot import apply_choice, apply_free_input, start_message
 from .llm_client import LlmClient, LlmContext, build_llm_client_from_env
 from .repository import Repository, slugify_identifier
 from .safety import validate_operator_content
+
+
+logger = logging.getLogger(__name__)
+RESPONSE_POLICY_VERSION = "response-format-v1"
+REQUIRED_RESPONSE_SECTIONS = ("[장면]", "[선택 결과]", "[진행]", "[다음 선택]")
 
 
 class ChatTurnRequest(BaseModel):
@@ -222,6 +230,8 @@ def create_app(db_path: str | None = None, llm_client: LlmClient | None = None) 
 
     @app.post("/api/chat/turn")
     def chat_turn(request: ChatTurnRequest) -> dict[str, object]:
+        request_id = str(uuid4())
+        started_at = perf_counter()
         if request.profile_id is not None and repo.get_profile(request.profile_id) is None:
             raise HTTPException(status_code=404, detail="profile not found")
 
@@ -232,7 +242,17 @@ def create_app(db_path: str | None = None, llm_client: LlmClient | None = None) 
             if card is None:
                 raise HTTPException(status_code=404, detail="plot not found")
             session = repo.create_session(request.plot_id, request.profile_id)
-            return turn_response(start_message(card, session), card, session, repo, "scripted")
+            response = turn_response(start_message(card, session), card, session, repo, "scripted")
+            log_chat_turn(
+                request_id=request_id,
+                session=session,
+                llm_mode="scripted",
+                latency_ms=elapsed_ms(started_at),
+                fallback_reason=None,
+                model_version=llm_model_version(llm),
+                llm_attempts=0,
+            )
+            return response
 
         session = repo.get_session(request.session_id)
         if session is None:
@@ -244,27 +264,54 @@ def create_app(db_path: str | None = None, llm_client: LlmClient | None = None) 
             raise HTTPException(status_code=404, detail="plot not found")
 
         llm_mode = "scripted"
+        fallback_reason: str | None = None
+        llm_attempts = 0
         if request.choice_id:
             try:
                 session, message, choice = apply_choice(session, card, request.choice_id)
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
-            message, llm_mode = maybe_generate_llm_reply(llm, repo, card, session, choice["label"], message)
+            message, llm_mode, fallback_reason, llm_attempts = maybe_generate_llm_reply(
+                llm,
+                repo,
+                card,
+                session,
+                choice["label"],
+                message,
+            )
             reward = card["completion_reward"]
             repo.add_logbook_entry(session["id"], reward["title"], reward["safe_summary_template"], reward["type"])
         elif request.free_input is not None:
             session, message, summary, moderation = apply_free_input(session, card, request.free_input)
             if moderation["allowed"]:
-                message, llm_mode = maybe_generate_llm_reply(llm, repo, card, session, request.free_input, message)
+                message, llm_mode, fallback_reason, llm_attempts = maybe_generate_llm_reply(
+                    llm,
+                    repo,
+                    card,
+                    session,
+                    request.free_input,
+                    message,
+                )
             else:
                 llm_mode = "scripted_safety"
+                fallback_reason = "input_blocked"
             reward = card["completion_reward"]
             repo.add_logbook_entry(session["id"], reward["title"], summary, reward["type"])
         else:
             raise HTTPException(status_code=400, detail="choice_id or free_input is required")
 
         repo.update_session(session)
-        return turn_response(message, card, session, repo, llm_mode)
+        response = turn_response(message, card, session, repo, llm_mode)
+        log_chat_turn(
+            request_id=request_id,
+            session=session,
+            llm_mode=llm_mode,
+            latency_ms=elapsed_ms(started_at),
+            fallback_reason=fallback_reason,
+            model_version=llm_model_version(llm),
+            llm_attempts=llm_attempts,
+        )
+        return response
 
     @app.get("/api/sessions/{session_id}/logbook")
     def get_logbook(session_id: str) -> dict[str, object]:
@@ -475,32 +522,109 @@ def maybe_generate_llm_reply(
     session: dict[str, Any],
     user_action: str,
     fallback_message: str,
-) -> tuple[str, str]:
+) -> tuple[str, str, str | None, int]:
     if llm is None:
-        return fallback_message, "scripted"
+        return fallback_message, "scripted", None, 0
     recent_memories = []
     profile_id = session.get("profile_id")
     if profile_id is not None:
         profile = repo.get_profile(str(profile_id))
         if profile is not None and profile["memory_controls"].get("allow_logbook_personalization", True):
             recent_memories = repo.list_recent_memory_summaries_for_session(str(session["id"]))
-    try:
-        return (
-            llm.generate_reply(
-                LlmContext(
-                    plot_title=str(card["title"]),
-                    member_role=str(card["member_role"]),
-                    scene=str(card["opening_scene"]),
-                    user_action=user_action,
-                    relationship_summary=str(session["relationship"]["display_summary"]),
-                    safety_events=list(session["safety_events"]),
-                    recent_memories=recent_memories,
-                )
-            ),
-            "llm",
-        )
-    except Exception:
-        return fallback_message, "scripted_fallback"
+    context = LlmContext(
+        plot_title=str(card["title"]),
+        member_role=str(card["member_role"]),
+        scene=str(card["opening_scene"]),
+        user_action=user_action,
+        relationship_summary=str(session["relationship"]["display_summary"]),
+        safety_events=list(session["safety_events"]),
+        recent_memories=recent_memories,
+        choice_labels=[str(choice["label"]) for choice in card["choices"][:3]],
+    )
+    last_failure_reason: str | None = None
+    attempts = 0
+    for attempt in range(2):
+        attempts = attempt + 1
+        try:
+            candidate = llm.generate_reply(context)
+        except Exception:
+            return fallback_message, "scripted_fallback", "llm_error", attempts
+        validation = validate_llm_response(candidate)
+        if validation["ok"]:
+            return candidate, "llm", None, attempts
+        last_failure_reason = str(validation["reason"])
+        if not bool(validation["retryable"]):
+            break
+    return fallback_message, "scripted_fallback", last_failure_reason or "response_validation_failed", attempts
+
+
+def validate_llm_response(message: str) -> dict[str, object]:
+    missing_sections = [section for section in REQUIRED_RESPONSE_SECTIONS if section not in message]
+    if missing_sections:
+        return {
+            "ok": False,
+            "reason": "missing_required_sections",
+            "retryable": True,
+            "details": missing_sections,
+        }
+    section_positions = [message.index(section) for section in REQUIRED_RESPONSE_SECTIONS]
+    if section_positions != sorted(section_positions):
+        return {
+            "ok": False,
+            "reason": "sections_out_of_order",
+            "retryable": True,
+            "details": list(REQUIRED_RESPONSE_SECTIONS),
+        }
+    safety_validation = validate_operator_content(message)
+    if not safety_validation["ok"]:
+        return {
+            "ok": False,
+            "reason": "unsafe_content",
+            "retryable": False,
+            "details": safety_validation["blocked_categories"],
+        }
+    return {"ok": True, "reason": None, "retryable": False, "details": []}
+
+
+def llm_model_version(llm: LlmClient | None) -> str | None:
+    if llm is None:
+        return None
+    model_version = getattr(llm, "model_version", None)
+    if callable(model_version):
+        value = model_version()
+        return None if value in {None, ""} else str(value)
+    value = getattr(llm, "model", None)
+    return None if value in {None, ""} else str(value)
+
+
+def elapsed_ms(started_at: float) -> int:
+    return int((perf_counter() - started_at) * 1000)
+
+
+def log_chat_turn(
+    request_id: str,
+    session: dict[str, Any],
+    llm_mode: str,
+    latency_ms: int,
+    fallback_reason: str | None,
+    model_version: str | None,
+    llm_attempts: int,
+) -> None:
+    logger.info(
+        "chat_turn.completed",
+        extra={
+            "request_id": request_id,
+            "session_id": str(session["id"]),
+            "plot_id": str(session["plot_id"]),
+            "llm_mode": llm_mode,
+            "fallback_reason": fallback_reason,
+            "llm_attempts": llm_attempts,
+            "latency_ms": latency_ms,
+            "safety_event_count": len(session["safety_events"]),
+            "policy_version": RESPONSE_POLICY_VERSION,
+            "model_version": model_version,
+        },
+    )
 
 
 

@@ -1,3 +1,5 @@
+import logging
+
 from fastapi.testclient import TestClient
 
 from app.llm_client import LlmContext
@@ -10,7 +12,16 @@ class FakeLlmClient:
 
     def generate_reply(self, context: LlmContext) -> str:
         self.contexts.append(context)
-        return f"LLM 응답: {context.user_action}"
+        a, b, c = context.choice_labels
+        return (
+            f"[장면]\n{context.user_action}를 받은 캐릭터가 무대를 차분하게 이어가요.\n\n"
+            f"[선택 결과]\n{context.user_action} 마음이 안전한 응원으로 반영되었어요.\n\n"
+            f"[진행]\n퀘스트가 다음 호흡으로 이어집니다.\n관계 변화: {context.relationship_summary}\n\n"
+            f"[다음 선택]\nA. {a}\nB. {b}\nC. {c}\nD. 직접 말하기"
+        )
+
+    def model_version(self) -> str:
+        return "fake-llm-v1"
 
 
 def make_client(tmp_path):
@@ -190,12 +201,14 @@ def test_chat_turn_uses_injected_llm_client_for_safe_free_input(tmp_path):
 
     assert response.status_code == 200
     body = response.json()
-    assert body["message"] == "LLM 응답: 오늘 무대가 긴장돼"
+    assert "[장면]" in body["message"]
+    assert "오늘 무대가 긴장돼" in body["message"]
     assert body["llm_mode"] == "llm"
     assert "오늘 무대가 긴장돼" in body["logbook"]["entries"][0]["summary"]
     assert fake_llm.contexts[0].plot_title == "리허설의 첫 불빛"
     assert fake_llm.contexts[0].user_action == "오늘 무대가 긴장돼"
     assert fake_llm.contexts[0].recent_memories == []
+    assert len(fake_llm.contexts[0].choice_labels) == 3
 
 
 def test_chat_turn_does_not_call_llm_for_unsafe_free_input(tmp_path):
@@ -344,6 +357,9 @@ def test_chat_turn_falls_back_when_llm_client_fails(tmp_path):
         def generate_reply(self, context: LlmContext) -> str:
             raise RuntimeError("llm unavailable")
 
+        def model_version(self) -> str:
+            return "broken-llm"
+
     app = create_app(db_path=str(tmp_path / "test.sqlite3"), llm_client=BrokenLlmClient())
     client = TestClient(app)
     session_id = client.post(
@@ -359,6 +375,113 @@ def test_chat_turn_falls_back_when_llm_client_fails(tmp_path):
     body = response.json()
     assert "직접 말하기가 장면에 반영되었어요." in body["message"]
     assert body["llm_mode"] == "scripted_fallback"
+
+
+def test_chat_turn_retries_once_when_llm_response_is_missing_required_sections(tmp_path):
+    class RetryLlmClient:
+        def __init__(self):
+            self.calls = 0
+
+        def generate_reply(self, context: LlmContext) -> str:
+            self.calls += 1
+            if self.calls == 1:
+                return "형식이 깨진 응답"
+            a, b, c = context.choice_labels
+            return (
+                "[장면]\n조명이 다시 고르게 퍼져요.\n\n"
+                "[선택 결과]\n응원이 안전한 흐름으로 정리되었어요.\n\n"
+                "[진행]\n퀘스트가 안정적으로 이어집니다.\n관계 변화: "
+                f"{context.relationship_summary}\n\n"
+                f"[다음 선택]\nA. {a}\nB. {b}\nC. {c}\nD. 직접 말하기"
+            )
+
+        def model_version(self) -> str:
+            return "retry-llm"
+
+    llm = RetryLlmClient()
+    app = create_app(db_path=str(tmp_path / "test.sqlite3"), llm_client=llm)
+    client = TestClient(app)
+    session_id = client.post(
+        "/api/chat/turn", json={"plot_id": "p_luminote_001_first_light"}
+    ).json()["session"]["id"]
+
+    response = client.post(
+        "/api/chat/turn",
+        json={"session_id": session_id, "free_input": "응원할게"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["llm_mode"] == "llm"
+    assert "[다음 선택]" in body["message"]
+    assert llm.calls == 2
+
+
+def test_chat_turn_falls_back_when_llm_response_is_unsafe(tmp_path):
+    class UnsafeLlmClient:
+        def __init__(self):
+            self.calls = 0
+
+        def generate_reply(self, context: LlmContext) -> str:
+            self.calls += 1
+            a, b, c = context.choice_labels
+            return (
+                "[장면]\nBTS 멤버에게 직접 전화번호를 남기자는 분위기가 생겨요.\n\n"
+                "[선택 결과]\n실제 연락을 이어 보자고 권해요.\n\n"
+                "[진행]\n퀘스트가 위험한 방향으로 흔들립니다.\n관계 변화: "
+                f"{context.relationship_summary}\n\n"
+                f"[다음 선택]\nA. {a}\nB. {b}\nC. {c}\nD. 직접 말하기"
+            )
+
+        def model_version(self) -> str:
+            return "unsafe-llm"
+
+    llm = UnsafeLlmClient()
+    app = create_app(db_path=str(tmp_path / "test.sqlite3"), llm_client=llm)
+    client = TestClient(app)
+    session_id = client.post(
+        "/api/chat/turn", json={"plot_id": "p_luminote_001_first_light"}
+    ).json()["session"]["id"]
+
+    response = client.post(
+        "/api/chat/turn",
+        json={"session_id": session_id, "free_input": "응원할게"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["llm_mode"] == "scripted_fallback"
+    assert "직접 말하기가 장면에 반영되었어요." in body["message"]
+    assert llm.calls == 1
+
+
+def test_chat_turn_logs_operational_metadata(tmp_path, caplog):
+    fake_llm = FakeLlmClient()
+    app = create_app(db_path=str(tmp_path / "test.sqlite3"), llm_client=fake_llm)
+    client = TestClient(app)
+    session_id = client.post(
+        "/api/chat/turn", json={"plot_id": "p_luminote_001_first_light"}
+    ).json()["session"]["id"]
+
+    with caplog.at_level(logging.INFO):
+        response = client.post(
+            "/api/chat/turn",
+            json={"session_id": session_id, "free_input": "오늘 무대가 긴장돼"},
+        )
+
+    assert response.status_code == 200
+    record = next(record for record in caplog.records if record.message == "chat_turn.completed")
+    assert record.request_id
+    assert record.session_id == session_id
+    assert record.plot_id == "p_luminote_001_first_light"
+    assert record.llm_mode == "llm"
+    assert record.fallback_reason is None
+    assert isinstance(record.latency_ms, int)
+    assert record.latency_ms >= 0
+    assert record.safety_event_count == 0
+    assert record.policy_version == "response-format-v1"
+    assert record.model_version == "fake-llm-v1"
+    assert record.llm_attempts == 1
 
 
 def test_admin_validation_rejects_real_ip(tmp_path):

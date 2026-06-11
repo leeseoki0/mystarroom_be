@@ -31,6 +31,7 @@ def test_openai_compatible_client_posts_chat_completion_request():
             relationship_summary="신뢰 0, 영감 1",
             safety_events=[{"category": "real_ip", "action": "redirected", "label": "실제 IP 요청"}],
             recent_memories=[],
+            choice_labels=["응원 메모를 남긴다", "호흡을 맞춘다", "조명을 고른다"],
         )
     )
 
