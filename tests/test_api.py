@@ -75,3 +75,20 @@ def test_admin_validation_rejects_real_ip(tmp_path):
     assert response.status_code == 200
     assert response.json()["ok"] is False
     assert "실제 IP" in " ".join(response.json()["errors"])
+
+
+def test_cors_allows_localhost_and_loopback_frontend_origins(tmp_path):
+    client = make_client(tmp_path)
+
+    for origin in ("http://localhost:5173", "http://127.0.0.1:5173"):
+        response = client.options(
+            "/api/chat/turn",
+            headers={
+                "Origin": origin,
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "content-type",
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.headers["access-control-allow-origin"] == origin
