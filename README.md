@@ -51,7 +51,7 @@ The frontend still calls only this FastAPI backend; never expose the LLM server 
 ## Test
 
 ```bash
-PYTHONPATH=. python3 -m pytest tests -q
+pytest -q
 ```
 
 ## API

@@ -12,7 +12,7 @@
 ### Verification
 
 ```bash
-PYTHONPATH=. python3 -m pytest tests -q
+pytest -q
 ```
 
 Result: `4 passed, 1 warning`.
@@ -27,7 +27,7 @@ Result: `4 passed, 1 warning`.
 ### Verification
 
 ```bash
-PYTHONPATH=. python3 -m pytest tests -q
+pytest -q
 ```
 
 Result: `5 passed, 1 warning`.
@@ -44,7 +44,7 @@ Result: `5 passed, 1 warning`.
 ### Verification
 
 ```bash
-PYTHONPATH=. python3 -m pytest tests -q
+pytest -q
 ```
 
 Result: `10 passed, 1 warning`.
