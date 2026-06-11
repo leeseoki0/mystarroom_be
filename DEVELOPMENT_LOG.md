@@ -32,6 +32,23 @@ PYTHONPATH=. python3 -m pytest tests -q
 
 Result: `5 passed, 1 warning`.
 
+## 2026-06-11 — OpenAI-compatible LLM provider scaffolding
+
+### Summary
+
+- Added an optional OpenAI-compatible LLM client for LM Studio or similar servers.
+- Kept `LLM_PROVIDER=scripted` as the safe default fallback when no external model is configured.
+- Added `.env.example` and README setup notes for `LLM_BASE_URL`, `LLM_API_KEY`, and `LLM_MODEL`.
+- Extended chat turn responses with `llm_mode` and logbook entries for frontend synchronization.
+
+### Verification
+
+```bash
+PYTHONPATH=. python3 -m pytest tests -q
+```
+
+Result: `10 passed, 1 warning`.
+
 ### Merge policy note
 
 During the initial MVP build, changes are merged directly into `main` after local verification, with this log used as the merge record. Final product review will focus on the latest `main` state.

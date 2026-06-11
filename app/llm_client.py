@@ -1,0 +1,101 @@
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from typing import Protocol
+
+import httpx
+
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - optional local-dev convenience
+    load_dotenv = None
+
+if load_dotenv:
+    load_dotenv()
+
+
+@dataclass(frozen=True)
+class LlmContext:
+    plot_title: str
+    member_role: str
+    scene: str
+    user_action: str
+    relationship_summary: str
+    safety_events: list[str]
+
+
+class LlmClient(Protocol):
+    def generate_reply(self, context: LlmContext) -> str:
+        ...
+
+
+class OpenAICompatibleLlmClient:
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        model: str,
+        http_client: httpx.Client | None = None,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.model = model
+        self.http_client = http_client or httpx.Client(timeout=30)
+
+    def generate_reply(self, context: LlmContext) -> str:
+        response = self.http_client.post(
+            f"{self.base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            json={
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": build_system_prompt()},
+                    {"role": "user", "content": build_user_prompt(context)},
+                ],
+                "temperature": 0.8,
+                "max_tokens": 500,
+            },
+        )
+        response.raise_for_status()
+        data = response.json()
+        content = data["choices"][0]["message"]["content"]
+        return str(content).strip()
+
+
+def build_llm_client_from_env() -> LlmClient | None:
+    provider = os.getenv("LLM_PROVIDER", "scripted").strip().lower()
+    if provider in {"", "scripted", "none"}:
+        return None
+    if provider != "openai_compatible":
+        raise ValueError(f"Unsupported LLM_PROVIDER: {provider}")
+
+    base_url = os.getenv("LLM_BASE_URL", "").strip()
+    model = os.getenv("LLM_MODEL", "").strip()
+    api_key = os.getenv("LLM_API_KEY", "lm-studio").strip()
+    if not base_url or not model:
+        raise ValueError("LLM_BASE_URL and LLM_MODEL are required for openai_compatible provider")
+    return OpenAICompatibleLlmClient(base_url=base_url, api_key=api_key, model=model)
+
+
+def build_system_prompt() -> str:
+    return (
+        "너는 '루미노트'라는 완전 가상 아이돌 팬서비스의 안전한 캐릭터 응답 엔진이다. "
+        "실제 인물, 실제 아이돌 그룹, 실제 IP를 언급하거나 흉내 내지 않는다. "
+        "사용자를 과몰입시키는 독점적 관계 표현, 외부 연락처 요구, 개인정보 저장 요청은 피한다. "
+        "한국어로 3~6문장 정도의 따뜻한 장면 응답을 작성한다. "
+        "공식 플롯 맥락과 관계 요약을 유지하고, 선택지 결과처럼 자연스럽게 반응한다."
+    )
+
+
+def build_user_prompt(context: LlmContext) -> str:
+    safety = ", ".join(context.safety_events) if context.safety_events else "없음"
+    return (
+        f"플롯: {context.plot_title}\n"
+        f"캐릭터 역할: {context.member_role}\n"
+        f"현재 장면: {context.scene}\n"
+        f"사용자 행동/입력: {context.user_action}\n"
+        f"관계 요약: {context.relationship_summary}\n"
+        f"안전 이벤트: {safety}\n\n"
+        "위 정보를 바탕으로 팬서비스 챗봇의 다음 응답만 작성해줘."
+    )

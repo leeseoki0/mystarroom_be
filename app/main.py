@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from .chatbot import apply_choice, apply_free_input, find_plot, start_message
+from .llm_client import LlmClient, LlmContext, build_llm_client_from_env
 from .plot_cards import PLOT_CARDS
 from .repository import Repository
 from .safety import validate_operator_content
@@ -24,7 +26,7 @@ class AdminPlotValidationRequest(BaseModel):
     one_line_hook: str = Field(default="")
 
 
-def create_app(db_path: str | None = None) -> FastAPI:
+def create_app(db_path: str | None = None, llm_client: LlmClient | None = None) -> FastAPI:
     app = FastAPI(title="Luminote AI Fan Service API")
     app.add_middleware(
         CORSMiddleware,
@@ -40,6 +42,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
     )
 
     repo = Repository(db_path or str(Path(__file__).resolve().parents[1] / "data" / "luminote.sqlite3"))
+    llm = llm_client if llm_client is not None else build_llm_client_from_env()
 
     @app.get("/api/health")
     def health() -> dict[str, str]:
@@ -58,7 +61,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
             if card is None:
                 raise HTTPException(status_code=404, detail="plot not found")
             session = repo.create_session(request.plot_id)
-            return {"message": start_message(card, session), "choices": card["choices"], "session": public_session(session)}
+            return turn_response(start_message(card, session), card, session, repo, "scripted")
 
         session = repo.get_session(request.session_id)
         if session is None:
@@ -67,22 +70,25 @@ def create_app(db_path: str | None = None) -> FastAPI:
         if card is None:
             raise HTTPException(status_code=404, detail="plot not found")
 
+        llm_mode = "scripted"
         if request.choice_id:
             try:
-                session, message, _choice = apply_choice(session, card, request.choice_id)
+                session, message, choice = apply_choice(session, card, request.choice_id)
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
+            message, llm_mode = maybe_generate_llm_reply(llm, card, session, choice["label"], message)
             reward = card["completion_reward"]
             repo.add_logbook_entry(session["id"], reward["title"], reward["safe_summary_template"], reward["type"])
         elif request.free_input is not None:
             session, message, summary = apply_free_input(session, card, request.free_input)
+            message, llm_mode = maybe_generate_llm_reply(llm, card, session, request.free_input, message)
             reward = card["completion_reward"]
             repo.add_logbook_entry(session["id"], reward["title"], summary, reward["type"])
         else:
             raise HTTPException(status_code=400, detail="choice_id or free_input is required")
 
         repo.update_session(session)
-        return {"message": message, "choices": card["choices"], "session": public_session(session)}
+        return turn_response(message, card, session, repo, llm_mode)
 
     @app.get("/api/sessions/{session_id}/logbook")
     def get_logbook(session_id: str) -> dict[str, object]:
@@ -109,6 +115,49 @@ def public_session(session: dict[str, object]) -> dict[str, object]:
         "relationship": session["relationship"],
         "safety_events": session["safety_events"],
     }
+
+
+def turn_response(
+    message: str,
+    card: dict[str, Any],
+    session: dict[str, Any],
+    repo: Repository,
+    llm_mode: str,
+) -> dict[str, object]:
+    return {
+        "message": message,
+        "choices": card["choices"],
+        "session": public_session(session),
+        "logbook": {"entries": repo.list_logbook_entries(str(session["id"]))},
+        "llm_mode": llm_mode,
+    }
+
+
+def maybe_generate_llm_reply(
+    llm: LlmClient | None,
+    card: dict[str, Any],
+    session: dict[str, Any],
+    user_action: str,
+    fallback_message: str,
+) -> tuple[str, str]:
+    if llm is None:
+        return fallback_message, "scripted"
+    try:
+        return (
+            llm.generate_reply(
+                LlmContext(
+                    plot_title=str(card["title"]),
+                    member_role=str(card["member_role"]),
+                    scene=str(card["opening_scene"]),
+                    user_action=user_action,
+                    relationship_summary=str(session["relationship"]["display_summary"]),
+                    safety_events=list(session["safety_events"]),
+                )
+            ),
+            "llm",
+        )
+    except Exception:
+        return fallback_message, "scripted_fallback"
 
 
 app = create_app()
