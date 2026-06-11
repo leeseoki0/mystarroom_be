@@ -23,6 +23,7 @@ class LlmContext:
     user_action: str
     relationship_summary: str
     safety_events: list[str]
+    recent_memories: list[str]
 
 
 class LlmClient(Protocol):
@@ -90,12 +91,14 @@ def build_system_prompt() -> str:
 
 def build_user_prompt(context: LlmContext) -> str:
     safety = ", ".join(context.safety_events) if context.safety_events else "없음"
+    memories = " | ".join(context.recent_memories) if context.recent_memories else "없음"
     return (
         f"플롯: {context.plot_title}\n"
         f"캐릭터 역할: {context.member_role}\n"
         f"현재 장면: {context.scene}\n"
         f"사용자 행동/입력: {context.user_action}\n"
         f"관계 요약: {context.relationship_summary}\n"
+        f"최근 기억 조각: {memories}\n"
         f"안전 이벤트: {safety}\n\n"
         "위 정보를 바탕으로 팬서비스 챗봇의 다음 응답만 작성해줘."
     )

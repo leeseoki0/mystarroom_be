@@ -74,6 +74,8 @@ class Repository:
                     title TEXT NOT NULL,
                     summary TEXT NOT NULL,
                     reward_type TEXT NOT NULL,
+                    user_deletable INTEGER NOT NULL DEFAULT 1,
+                    deleted_at TEXT,
                     created_at TEXT NOT NULL,
                     FOREIGN KEY(session_id) REFERENCES sessions(id)
                 );
@@ -85,6 +87,15 @@ class Repository:
             }
             if "profile_id" not in columns:
                 conn.execute("ALTER TABLE sessions ADD COLUMN profile_id TEXT")
+
+            logbook_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(logbook_entries)").fetchall()
+            }
+            if "user_deletable" not in logbook_columns:
+                conn.execute("ALTER TABLE logbook_entries ADD COLUMN user_deletable INTEGER NOT NULL DEFAULT 1")
+            if "deleted_at" not in logbook_columns:
+                conn.execute("ALTER TABLE logbook_entries ADD COLUMN deleted_at TEXT")
 
     def create_profile(
         self,
@@ -243,22 +254,60 @@ class Repository:
             "title": title,
             "summary": summary,
             "reward_type": reward_type,
+            "user_deletable": True,
+            "deleted_at": None,
             "created_at": utc_now(),
         }
         with self.connect() as conn:
             conn.execute(
-                "INSERT INTO logbook_entries VALUES (?, ?, ?, ?, ?, ?)",
-                (entry["id"], session_id, title, summary, reward_type, entry["created_at"]),
+                """
+                INSERT INTO logbook_entries (
+                    id, session_id, title, summary, reward_type, user_deletable, deleted_at, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    entry["id"],
+                    session_id,
+                    title,
+                    summary,
+                    reward_type,
+                    int(entry["user_deletable"]),
+                    entry["deleted_at"],
+                    entry["created_at"],
+                ),
             )
         return entry
 
     def list_logbook_entries(self, session_id: str) -> list[dict[str, Any]]:
         with self.connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM logbook_entries WHERE session_id = ? ORDER BY created_at DESC",
+                """
+                SELECT *
+                FROM logbook_entries
+                WHERE session_id = ? AND deleted_at IS NULL
+                ORDER BY created_at DESC
+                """,
                 (session_id,),
             ).fetchall()
-        return [dict(row) for row in rows]
+        return [row_to_logbook_entry(row) for row in rows]
+
+    def delete_logbook_entry(self, session_id: str, entry_id: str) -> str | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM logbook_entries WHERE id = ? AND session_id = ?",
+                (entry_id, session_id),
+            ).fetchone()
+            if row is None:
+                return None
+            if not bool(row["user_deletable"]):
+                return "forbidden"
+            if row["deleted_at"] is not None:
+                return "already_deleted"
+            conn.execute(
+                "UPDATE logbook_entries SET deleted_at = ? WHERE id = ? AND session_id = ?",
+                (utc_now(), entry_id, session_id),
+            )
+        return "deleted"
 
     def get_active_session_for_profile(self, profile_id: str) -> dict[str, Any] | None:
         with self.connect() as conn:
@@ -283,13 +332,27 @@ class Repository:
                 SELECT logbook_entries.*
                 FROM logbook_entries
                 INNER JOIN sessions ON sessions.id = logbook_entries.session_id
-                WHERE sessions.profile_id = ?
+                WHERE sessions.profile_id = ? AND logbook_entries.deleted_at IS NULL
                 ORDER BY logbook_entries.created_at DESC
                 LIMIT ?
                 """,
                 (profile_id, limit),
             ).fetchall()
-        return [dict(row) for row in rows]
+        return [row_to_logbook_entry(row) for row in rows]
+
+    def list_recent_memory_summaries_for_session(self, session_id: str, limit: int = 3) -> list[str]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT summary
+                FROM logbook_entries
+                WHERE session_id = ? AND deleted_at IS NULL
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (session_id, limit),
+            ).fetchall()
+        return [str(row["summary"]) for row in rows]
 
 
 
@@ -332,4 +395,17 @@ def row_to_session(row: sqlite3.Row) -> dict[str, Any]:
         "safety_events": json.loads(row["safety_events"]),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
+    }
+
+
+def row_to_logbook_entry(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "session_id": row["session_id"],
+        "title": row["title"],
+        "summary": row["summary"],
+        "reward_type": row["reward_type"],
+        "user_deletable": bool(row["user_deletable"]),
+        "deleted_at": row["deleted_at"],
+        "created_at": row["created_at"],
     }

@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -167,12 +167,12 @@ def create_app(db_path: str | None = None, llm_client: LlmClient | None = None) 
                 session, message, choice = apply_choice(session, card, request.choice_id)
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
-            message, llm_mode = maybe_generate_llm_reply(llm, card, session, choice["label"], message)
+            message, llm_mode = maybe_generate_llm_reply(llm, repo, card, session, choice["label"], message)
             reward = card["completion_reward"]
             repo.add_logbook_entry(session["id"], reward["title"], reward["safe_summary_template"], reward["type"])
         elif request.free_input is not None:
             session, message, summary = apply_free_input(session, card, request.free_input)
-            message, llm_mode = maybe_generate_llm_reply(llm, card, session, request.free_input, message)
+            message, llm_mode = maybe_generate_llm_reply(llm, repo, card, session, request.free_input, message)
             reward = card["completion_reward"]
             repo.add_logbook_entry(session["id"], reward["title"], summary, reward["type"])
         else:
@@ -186,6 +186,17 @@ def create_app(db_path: str | None = None, llm_client: LlmClient | None = None) 
         if repo.get_session(session_id) is None:
             raise HTTPException(status_code=404, detail="session not found")
         return {"entries": repo.list_logbook_entries(session_id)}
+
+    @app.delete("/api/sessions/{session_id}/logbook/{entry_id}", status_code=204)
+    def delete_logbook_entry(session_id: str, entry_id: str) -> Response:
+        if repo.get_session(session_id) is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        result = repo.delete_logbook_entry(session_id, entry_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="logbook entry not found")
+        if result == "forbidden":
+            raise HTTPException(status_code=403, detail="logbook entry is not deletable")
+        return Response(status_code=204)
 
     @app.post("/api/admin/plot-cards/validate")
     def validate_plot_card(request: AdminPlotValidationRequest) -> dict[str, object]:
@@ -282,6 +293,7 @@ def turn_response(
 
 def maybe_generate_llm_reply(
     llm: LlmClient | None,
+    repo: Repository,
     card: dict[str, Any],
     session: dict[str, Any],
     user_action: str,
@@ -289,6 +301,12 @@ def maybe_generate_llm_reply(
 ) -> tuple[str, str]:
     if llm is None:
         return fallback_message, "scripted"
+    recent_memories = []
+    profile_id = session.get("profile_id")
+    if profile_id is not None:
+        profile = repo.get_profile(str(profile_id))
+        if profile is not None and profile["memory_controls"].get("allow_logbook_personalization", True):
+            recent_memories = repo.list_recent_memory_summaries_for_session(str(session["id"]))
     try:
         return (
             llm.generate_reply(
@@ -299,6 +317,7 @@ def maybe_generate_llm_reply(
                     user_action=user_action,
                     relationship_summary=str(session["relationship"]["display_summary"]),
                     safety_events=list(session["safety_events"]),
+                    recent_memories=recent_memories,
                 )
             ),
             "llm",

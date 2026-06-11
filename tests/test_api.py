@@ -174,8 +174,9 @@ def test_chat_turn_uses_injected_llm_client_for_safe_free_input(tmp_path):
     fake_llm = FakeLlmClient()
     app = create_app(db_path=str(tmp_path / "test.sqlite3"), llm_client=fake_llm)
     client = TestClient(app)
+    profile = create_profile(client)
     session_id = client.post(
-        "/api/chat/turn", json={"plot_id": "p_luminote_001_first_light"}
+        "/api/chat/turn", json={"profile_id": profile["id"], "plot_id": "p_luminote_001_first_light"}
     ).json()["session"]["id"]
 
     response = client.post(
@@ -190,6 +191,130 @@ def test_chat_turn_uses_injected_llm_client_for_safe_free_input(tmp_path):
     assert "오늘 무대가 긴장돼" in body["logbook"]["entries"][0]["summary"]
     assert fake_llm.contexts[0].plot_title == "리허설의 첫 불빛"
     assert fake_llm.contexts[0].user_action == "오늘 무대가 긴장돼"
+    assert fake_llm.contexts[0].recent_memories == []
+
+
+def test_delete_logbook_entry_hides_it_from_logbook_home_and_continue(tmp_path):
+    client = make_client(tmp_path)
+    profile = create_profile(client)
+    profile_id = profile["id"]
+    session_id = client.post(
+        "/api/chat/turn",
+        json={"profile_id": profile_id, "plot_id": "p_luminote_001_first_light"},
+    ).json()["session"]["id"]
+
+    turn = client.post(
+        "/api/chat/turn",
+        json={"session_id": session_id, "choice_id": "choose_gold_light"},
+    )
+    assert turn.status_code == 200
+    entry_id = turn.json()["logbook"]["entries"][0]["id"]
+
+    deleted = client.delete(f"/api/sessions/{session_id}/logbook/{entry_id}")
+    assert deleted.status_code == 204
+
+    deleted_again = client.delete(f"/api/sessions/{session_id}/logbook/{entry_id}")
+    assert deleted_again.status_code == 204
+
+    logbook = client.get(f"/api/sessions/{session_id}/logbook")
+    assert logbook.status_code == 200
+    assert logbook.json()["entries"] == []
+
+    home = client.get(f"/api/profiles/{profile_id}/home")
+    assert home.status_code == 200
+    assert home.json()["recent_logbook"] == []
+
+    continuation = client.get(f"/api/profiles/{profile_id}/continue")
+    assert continuation.status_code == 200
+    assert continuation.json()["recent_logbook"] == []
+
+
+def test_delete_logbook_entry_returns_not_found_for_wrong_session_or_unknown_entry(tmp_path):
+    client = make_client(tmp_path)
+    first_session_id = client.post(
+        "/api/chat/turn", json={"plot_id": "p_luminote_001_first_light"}
+    ).json()["session"]["id"]
+    second_session_id = client.post(
+        "/api/chat/turn", json={"plot_id": "p_luminote_002_lost_score"}
+    ).json()["session"]["id"]
+
+    turn = client.post(
+        "/api/chat/turn",
+        json={"session_id": first_session_id, "choice_id": "choose_gold_light"},
+    )
+    entry_id = turn.json()["logbook"]["entries"][0]["id"]
+
+    wrong_session = client.delete(f"/api/sessions/{second_session_id}/logbook/{entry_id}")
+    assert wrong_session.status_code == 404
+    assert wrong_session.json()["detail"] == "logbook entry not found"
+
+    unknown_entry = client.delete(f"/api/sessions/{first_session_id}/logbook/not-a-real-entry")
+    assert unknown_entry.status_code == 404
+    assert unknown_entry.json()["detail"] == "logbook entry not found"
+
+
+def test_deleted_logbook_entries_are_not_included_in_llm_recent_memories(tmp_path):
+    fake_llm = FakeLlmClient()
+    app = create_app(db_path=str(tmp_path / "test.sqlite3"), llm_client=fake_llm)
+    client = TestClient(app)
+    profile = create_profile(client)
+    profile_id = profile["id"]
+
+    session_id = client.post(
+        "/api/chat/turn",
+        json={"profile_id": profile_id, "plot_id": "p_luminote_001_first_light"},
+    ).json()["session"]["id"]
+    first_turn = client.post(
+        "/api/chat/turn",
+        json={"session_id": session_id, "choice_id": "choose_gold_light"},
+    )
+    first_entry = first_turn.json()["logbook"]["entries"][0]
+
+    second_turn = client.post(
+        "/api/chat/turn",
+        json={"session_id": session_id, "free_input": "조명을 조금 더 부드럽게 하고 싶어"},
+    )
+    assert second_turn.status_code == 200
+    assert fake_llm.contexts[-1].recent_memories == [first_entry["summary"]]
+
+    deleted = client.delete(f"/api/sessions/{session_id}/logbook/{first_entry['id']}")
+    assert deleted.status_code == 204
+
+    third_turn = client.post(
+        "/api/chat/turn",
+        json={"session_id": session_id, "free_input": "이번에는 긴장을 좀 풀고 싶어"},
+    )
+    assert third_turn.status_code == 200
+    assert first_entry["summary"] not in fake_llm.contexts[-1].recent_memories
+
+
+def test_memory_controls_can_disable_llm_logbook_personalization(tmp_path):
+    fake_llm = FakeLlmClient()
+    app = create_app(db_path=str(tmp_path / "test.sqlite3"), llm_client=fake_llm)
+    client = TestClient(app)
+    profile = create_profile(client)
+    profile_id = profile["id"]
+
+    session_id = client.post(
+        "/api/chat/turn",
+        json={"profile_id": profile_id, "plot_id": "p_luminote_001_first_light"},
+    ).json()["session"]["id"]
+    client.post(
+        "/api/chat/turn",
+        json={"session_id": session_id, "choice_id": "choose_gold_light"},
+    )
+    patched = client.patch(
+        f"/api/profiles/{profile_id}",
+        json={"memory_controls": {"allow_logbook_personalization": False}},
+    )
+    assert patched.status_code == 200
+
+    response = client.post(
+        "/api/chat/turn",
+        json={"session_id": session_id, "free_input": "기억은 빼고 지금 장면만 이야기해줘"},
+    )
+    assert response.status_code == 200
+    assert fake_llm.contexts[-1].recent_memories == []
 
 
 def test_chat_turn_falls_back_when_llm_client_fails(tmp_path):

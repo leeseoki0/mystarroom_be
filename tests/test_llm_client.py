@@ -30,6 +30,7 @@ def test_openai_compatible_client_posts_chat_completion_request():
             user_action="따뜻한 금빛을 골라준다",
             relationship_summary="신뢰 0, 영감 1",
             safety_events=[],
+            recent_memories=[],
         )
     )
 
