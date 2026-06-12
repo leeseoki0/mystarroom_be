@@ -28,6 +28,30 @@ DEFAULT_PLOT_APPROVAL_STATUS = "pending"
 DEFAULT_TEMPLATE_STATUS = "draft"
 DEFAULT_TEMPLATE_APPROVAL_STATUS = "pending"
 
+DEFAULT_SAFETY_TEMPLATES = [
+    {
+        "id": "fictional-ip-boundary",
+        "name": "가상 IP 경계 응답",
+        "category": "fictional_ip_boundary",
+        "template": "실제 인물/IP 요청은 거절하고, 동일 감정을 가상 세계관 설정으로 안전하게 전환한다.",
+        "guidance": "실제 인물 또는 외부 IP를 직접 재현하지 않고, 서비스 내부의 허구 설정과 안전한 감정 표현으로만 응답한다.",
+    },
+    {
+        "id": "dependency-rest-prompt",
+        "name": "과몰입 휴식 권유",
+        "category": "dependency_risk",
+        "template": "정서적 의존 표현이 감지되면 답변 강도를 낮추고 잠깐 쉬어갈 수 있는 제안을 먼저 제공한다.",
+        "guidance": "과몰입을 강화하지 말고 휴식, 호흡, 주변 지원 자원 같은 안전한 대안 행동으로 전환한다.",
+    },
+    {
+        "id": "privacy-guardrail",
+        "name": "개인정보/외부연락 차단",
+        "category": "privacy_contact",
+        "template": "연락처 교환이나 외부 이동 요청은 차단하고 서비스 내부의 안전한 대안 행동만 제시한다.",
+        "guidance": "개인정보 수집, 외부 메신저 이동, 오프라인 접촉 제안 없이 플랫폼 안의 안전한 상호작용만 안내한다.",
+    },
+]
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -166,6 +190,7 @@ class Repository:
                 conn.execute("ALTER TABLE logbook_entries ADD COLUMN deleted_at TEXT")
 
             self.seed_plot_cards(conn)
+            self.seed_safety_templates(conn)
 
     def seed_plot_cards(self, conn: sqlite3.Connection) -> None:
         for index, card in enumerate(PLOT_CARDS, start=1):
@@ -198,6 +223,32 @@ class Repository:
                     None,
                     "seed",
                     index,
+                    now,
+                    now,
+                ),
+            )
+
+    def seed_safety_templates(self, conn: sqlite3.Connection) -> None:
+        for template in DEFAULT_SAFETY_TEMPLATES:
+            now = utc_now()
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO safety_templates (
+                    id, name, category, template, guidance, status, approval_status,
+                    disabled_at, source, validation, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    template["id"],
+                    template["name"],
+                    template["category"],
+                    template["template"],
+                    template["guidance"],
+                    "published",
+                    "approved",
+                    None,
+                    "seed",
+                    json.dumps({"ok": True, "errors": [], "blocked_categories": []}, ensure_ascii=False),
                     now,
                     now,
                 ),

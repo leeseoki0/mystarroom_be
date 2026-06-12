@@ -808,6 +808,31 @@ def test_admin_plot_card_requires_three_standard_choices(tmp_path):
 
 
 
+def test_admin_safety_templates_are_seeded_for_fresh_db(tmp_path):
+    client = make_client(tmp_path)
+
+    response = client.get("/api/admin/safety-templates")
+
+    assert response.status_code == 200
+    templates = response.json()["safety_templates"]
+    assert len(templates) == 3
+    assert [template["id"] for template in templates] == [
+        "fictional-ip-boundary",
+        "dependency-rest-prompt",
+        "privacy-guardrail",
+    ]
+    assert [template["category"] for template in templates] == [
+        "fictional_ip_boundary",
+        "dependency_risk",
+        "privacy_contact",
+    ]
+    assert all(template["source"] == "seed" for template in templates)
+    assert all(template["status"] == "published" for template in templates)
+    assert all(template["approval_status"] == "approved" for template in templates)
+    assert all(template["validation"]["ok"] is True for template in templates)
+
+
+
 def test_admin_safety_template_crud_and_disable(tmp_path):
     client = make_client(tmp_path)
 
