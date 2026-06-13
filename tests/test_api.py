@@ -109,7 +109,8 @@ def test_chat_turn_starts_session_and_persists_logbook(tmp_path):
     start_response = client.post("/api/chat/turn", json={"plot_id": plot_id})
     assert start_response.status_code == 200
     started = start_response.json()
-    assert "[장면]" in started["message"]
+    assert "[장면]" not in started["message"]
+    assert started["response_metadata"]["sections"]["scene"]
     session_id = started["session"]["id"]
 
     choice_response = client.post(
@@ -126,6 +127,31 @@ def test_chat_turn_starts_session_and_persists_logbook(tmp_path):
     assert logbook_response.status_code == 200
     entries = logbook_response.json()["entries"]
     assert entries[0]["title"] == "첫 불빛의 색"
+
+
+def test_chat_turn_returns_persisted_chat_messages_and_response_metadata(tmp_path):
+    client = make_client(tmp_path)
+
+    started = client.post("/api/chat/turn", json={"plot_id": "p_luminote_001_first_light"}).json()
+    session_id = started["session"]["id"]
+
+    assert started["message"] == started["chat_messages"][-1]["content"]
+    assert started["chat_messages"][-1]["role"] == "assistant"
+    assert started["response_metadata"]["sections"]["scene"]
+    assert started["response_metadata"]["choices"][0]["label"] == started["choices"][0]["label"]
+
+    choice_response = client.post(
+        "/api/chat/turn",
+        json={"session_id": session_id, "choice_id": "choose_gold_light"},
+    )
+
+    assert choice_response.status_code == 200
+    body = choice_response.json()
+    assert [message["role"] for message in body["chat_messages"][-2:]] == ["user", "assistant"]
+    assert body["chat_messages"][-2]["content"] == "따뜻한 금빛을 골라준다"
+    assert body["message"] == body["chat_messages"][-1]["content"]
+    assert "[장면]" not in body["message"]
+    assert body["response_metadata"]["sections"]["progress"]
 
 
 def test_home_and_continue_return_active_session_profile_and_recent_logbook(tmp_path):
@@ -201,14 +227,38 @@ def test_chat_turn_uses_injected_llm_client_for_safe_free_input(tmp_path):
 
     assert response.status_code == 200
     body = response.json()
-    assert "[장면]" in body["message"]
+    assert "[장면]" not in body["message"]
     assert "오늘 무대가 긴장돼" in body["message"]
+    assert body["response_metadata"]["sections"]["scene"]
     assert body["llm_mode"] == "llm"
     assert "오늘 무대가 긴장돼" in body["logbook"]["entries"][0]["summary"]
     assert fake_llm.contexts[0].plot_title == "리허설의 첫 불빛"
     assert fake_llm.contexts[0].user_action == "오늘 무대가 긴장돼"
     assert fake_llm.contexts[0].recent_memories == []
+    assert fake_llm.contexts[0].recent_messages[-1]["content"] == "오늘 무대가 긴장돼"
     assert len(fake_llm.contexts[0].choice_labels) == 3
+
+
+def test_llm_context_includes_recent_chat_history(tmp_path):
+    fake_llm = FakeLlmClient()
+    app = create_app(db_path=str(tmp_path / "test.sqlite3"), llm_client=fake_llm)
+    client = TestClient(app)
+    profile = create_profile(client)
+    session_id = client.post(
+        "/api/chat/turn", json={"profile_id": profile["id"], "plot_id": "p_luminote_001_first_light"}
+    ).json()["session"]["id"]
+    client.post("/api/chat/turn", json={"session_id": session_id, "choice_id": "choose_gold_light"})
+
+    response = client.post(
+        "/api/chat/turn",
+        json={"session_id": session_id, "free_input": "방금 조명 선택을 기억하면서 말해줘"},
+    )
+
+    assert response.status_code == 200
+    recent_messages = fake_llm.contexts[-1].recent_messages
+    assert any(message["role"] == "assistant" and "리허설의 첫 불빛" in message["content"] for message in recent_messages)
+    assert any(message["role"] == "user" and message["content"] == "따뜻한 금빛을 골라준다" for message in recent_messages)
+    assert recent_messages[-1] == {"role": "user", "content": "방금 조명 선택을 기억하면서 말해줘"}
 
 
 def test_chat_turn_does_not_call_llm_for_unsafe_free_input(tmp_path):
@@ -448,7 +498,7 @@ def test_chat_turn_retries_once_when_llm_response_is_missing_required_sections(t
     assert response.status_code == 200
     body = response.json()
     assert body["llm_mode"] == "llm"
-    assert "[다음 선택]" in body["message"]
+    assert body["response_metadata"]["sections"]["nextChoices"]
     assert llm.calls == 2
 
 
@@ -490,6 +540,70 @@ def test_chat_turn_falls_back_when_llm_response_is_unsafe(tmp_path):
     assert llm.calls == 1
 
 
+def test_llm_settings_are_saved_masked_and_drive_openai_compatible_chat(tmp_path, monkeypatch):
+    created_clients = []
+
+    class FakeOpenAICompatibleClient:
+        def __init__(self, base_url: str, api_key: str, model: str):
+            self.base_url = base_url
+            self.api_key = api_key
+            self.model = model
+            created_clients.append(self)
+
+        def generate_reply(self, context: LlmContext) -> str:
+            a, b, c = context.choice_labels
+            return (
+                "[장면]\n외부 토큰으로 생성한 장면이 안전하게 이어져요.\n\n"
+                f"[선택 결과]\n{context.user_action} 입력을 반영했어요.\n\n"
+                "[진행]\n퀘스트가 실제 AI 응답으로 이어집니다.\n"
+                f"관계 변화: {context.relationship_summary}\n\n"
+                f"[다음 선택]\nA. {a}\nB. {b}\nC. {c}\nD. 직접 말하기"
+            )
+
+        def model_version(self) -> str:
+            return self.model
+
+    monkeypatch.setattr("app.main.OpenAICompatibleLlmClient", FakeOpenAICompatibleClient)
+    client = make_client(tmp_path)
+
+    empty = client.get("/api/llm-settings")
+    assert empty.status_code == 200
+    assert empty.json()["settings"]["api_key_configured"] is False
+
+    saved = client.patch(
+        "/api/llm-settings",
+        json={
+            "enabled": True,
+            "base_url": "https://rolled-logistics-highs-dans.trycloudflare.com/v1",
+            "api_key": "test-secret-token",
+            "model": "local-model",
+        },
+    )
+    assert saved.status_code == 200
+    settings = saved.json()["settings"]
+    assert settings["enabled"] is True
+    assert settings["base_url"] == "https://rolled-logistics-highs-dans.trycloudflare.com/v1"
+    assert settings["model"] == "local-model"
+    assert settings["api_key_configured"] is True
+    assert settings["masked_api_key"] == "test…oken"
+    assert "test-secret-token" not in str(settings)
+
+    session_id = client.post(
+        "/api/chat/turn", json={"plot_id": "p_luminote_001_first_light"}
+    ).json()["session"]["id"]
+    response = client.post(
+        "/api/chat/turn",
+        json={"session_id": session_id, "free_input": "외부 토큰 테스트"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["llm_mode"] == "llm"
+    assert "외부 토큰으로 생성한 장면" in response.json()["message"]
+    assert created_clients[0].base_url == "https://rolled-logistics-highs-dans.trycloudflare.com/v1"
+    assert created_clients[0].api_key == "test-secret-token"
+    assert created_clients[0].model == "local-model"
+
+
 def test_chat_turn_logs_operational_metadata(tmp_path, caplog):
     fake_llm = FakeLlmClient()
     app = create_app(db_path=str(tmp_path / "test.sqlite3"), llm_client=fake_llm)
@@ -515,7 +629,7 @@ def test_chat_turn_logs_operational_metadata(tmp_path, caplog):
     assert record.latency_ms >= 0
     assert record.llm_attempts == 1
     assert record.safety_event_count == 0
-    assert record.policy_version == "response-format-v1"
+    assert record.policy_version == "response-format-v2"
     assert record.model_version == "fake-llm-v1"
 
 

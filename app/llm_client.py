@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 import httpx
@@ -25,6 +25,7 @@ class LlmContext:
     safety_events: list[dict[str, str]]
     recent_memories: list[str]
     choice_labels: list[str]
+    recent_messages: list[dict[str, str]] = field(default_factory=list)
 
 
 class LlmClient(Protocol):
@@ -107,6 +108,11 @@ def build_user_prompt(context: LlmContext) -> str:
         else "없음"
     )
     memories = " | ".join(context.recent_memories) if context.recent_memories else "없음"
+    recent_messages = (
+        "\n".join(f"{message['role']}: {message['content']}" for message in context.recent_messages)
+        if context.recent_messages
+        else "없음"
+    )
     return (
         f"플롯: {context.plot_title}\n"
         f"캐릭터 역할: {context.member_role}\n"
@@ -114,6 +120,7 @@ def build_user_prompt(context: LlmContext) -> str:
         f"사용자 행동/입력: {context.user_action}\n"
         f"관계 요약: {context.relationship_summary}\n"
         f"최근 기억 조각: {memories}\n"
+        f"최근 대화:\n{recent_messages}\n"
         f"안전 이벤트: {safety}\n\n"
         "반드시 아래 형식만 사용해 응답해줘.\n"
         "[장면]\n(2~3문장 장면 묘사)\n\n"

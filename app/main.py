@@ -11,13 +11,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from .chatbot import apply_choice, apply_free_input, start_message
-from .llm_client import LlmClient, LlmContext, build_llm_client_from_env
+from .llm_client import LlmClient, LlmContext, OpenAICompatibleLlmClient, build_llm_client_from_env
 from .repository import Repository, slugify_identifier
 from .safety import validate_operator_content
 
 
 logger = logging.getLogger(__name__)
-RESPONSE_POLICY_VERSION = "response-format-v1"
+RESPONSE_POLICY_VERSION = "response-format-v2"
 REQUIRED_RESPONSE_SECTIONS = ("[장면]", "[선택 결과]", "[진행]", "[다음 선택]")
 
 
@@ -156,6 +156,13 @@ class ContentReportCreateRequest(BaseModel):
     details: str = Field(default="")
 
 
+class LlmSettingsUpdateRequest(BaseModel):
+    enabled: bool | None = None
+    base_url: str | None = None
+    api_key: str | None = None
+    model: str | None = None
+
+
 
 def create_app(db_path: str | None = None, llm_client: LlmClient | None = None) -> FastAPI:
     app = FastAPI(title="Luminote AI Fan Service API")
@@ -173,11 +180,20 @@ def create_app(db_path: str | None = None, llm_client: LlmClient | None = None) 
     )
 
     repo = Repository(db_path or str(Path(__file__).resolve().parents[1] / "data" / "luminote.sqlite3"))
-    llm = llm_client if llm_client is not None else build_llm_client_from_env()
+    injected_llm = llm_client
 
     @app.get("/api/health")
     def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/api/llm-settings")
+    def get_llm_settings() -> dict[str, object]:
+        return {"settings": public_llm_settings(repo.get_llm_settings())}
+
+    @app.patch("/api/llm-settings")
+    def update_llm_settings(request: LlmSettingsUpdateRequest) -> dict[str, object]:
+        settings = repo.update_llm_settings(to_payload_dict(request))
+        return {"settings": public_llm_settings(settings)}
 
     @app.get("/api/plot-cards")
     def list_plot_cards() -> dict[str, object]:
@@ -250,6 +266,8 @@ def create_app(db_path: str | None = None, llm_client: LlmClient | None = None) 
         if request.profile_id is not None and repo.get_profile(request.profile_id) is None:
             raise HTTPException(status_code=404, detail="profile not found")
 
+        llm = resolve_llm_client(injected_llm, repo)
+
         if request.session_id is None:
             if request.plot_id is None:
                 raise HTTPException(status_code=400, detail="plot_id is required to start a session")
@@ -257,7 +275,9 @@ def create_app(db_path: str | None = None, llm_client: LlmClient | None = None) 
             if card is None:
                 raise HTTPException(status_code=404, detail="plot not found")
             session = repo.create_session(request.plot_id, request.profile_id)
-            response = turn_response(start_message(card, session), card, session, repo, "scripted")
+            message = start_message(card, session)
+            repo.add_chat_message(session["id"], "assistant", natural_chat_message(message))
+            response = turn_response(message, card, session, repo, "scripted")
             log_chat_turn(
                 request_id=request_id,
                 session=session,
@@ -286,6 +306,7 @@ def create_app(db_path: str | None = None, llm_client: LlmClient | None = None) 
                 session, message, choice = apply_choice(session, card, request.choice_id)
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
+            repo.add_chat_message(session["id"], "user", str(choice["label"]))
             message, llm_mode, fallback_reason, llm_attempts = maybe_generate_llm_reply(
                 llm,
                 repo,
@@ -298,6 +319,8 @@ def create_app(db_path: str | None = None, llm_client: LlmClient | None = None) 
             repo.add_logbook_entry(session["id"], reward["title"], reward["safe_summary_template"], reward["type"])
         elif request.free_input is not None:
             session, message, summary, moderation = apply_free_input(session, card, request.free_input)
+            user_message = request.free_input if moderation["allowed"] else "안전 정책에 따라 숨긴 사용자 입력"
+            repo.add_chat_message(session["id"], "user", user_message)
             if moderation["allowed"]:
                 message, llm_mode, fallback_reason, llm_attempts = maybe_generate_llm_reply(
                     llm,
@@ -315,6 +338,7 @@ def create_app(db_path: str | None = None, llm_client: LlmClient | None = None) 
         else:
             raise HTTPException(status_code=400, detail="choice_id or free_input is required")
 
+        repo.add_chat_message(session["id"], "assistant", natural_chat_message(message))
         repo.update_session(session)
         response = turn_response(message, card, session, repo, llm_mode)
         log_chat_turn(
@@ -593,13 +617,100 @@ def turn_response(
     llm_mode: str,
 ) -> dict[str, object]:
     return {
-        "message": message,
+        "message": natural_chat_message(message),
+        "response_metadata": response_metadata(message, card),
+        "chat_messages": public_chat_messages(repo.list_chat_messages(str(session["id"]))),
         "choices": card["choices"],
         "session": public_session(session),
         "logbook": {"entries": repo.list_logbook_entries(str(session["id"]))},
         "llm_mode": llm_mode,
     }
 
+
+def response_metadata(message: str, card: dict[str, Any]) -> dict[str, object]:
+    sections = extract_response_sections(message)
+    return {
+        "sections": sections,
+        "choices": card["choices"],
+        "format_version": RESPONSE_POLICY_VERSION,
+    }
+
+
+def public_chat_messages(messages: list[dict[str, Any]]) -> list[dict[str, str]]:
+    return [{"role": str(message["role"]), "content": str(message["content"])} for message in messages]
+
+
+def natural_chat_message(message: str) -> str:
+    sections = extract_response_sections(message)
+    if not any(sections.values()):
+        return message
+    parts = [sections["scene"], sections["result"], sections["progress"]]
+    return "\n\n".join(part for part in parts if part).strip()
+
+
+def extract_response_sections(message: str) -> dict[str, object]:
+    labels = {
+        "scene": "[장면]",
+        "result": "[선택 결과]",
+        "progress": "[진행]",
+        "nextChoices": "[다음 선택]",
+    }
+    sections: dict[str, object] = {"scene": "", "result": "", "progress": "", "nextChoices": []}
+    positions = [(key, message.find(label), label) for key, label in labels.items() if message.find(label) >= 0]
+    positions.sort(key=lambda item: item[1])
+    for index, (key, start, label) in enumerate(positions):
+        end = positions[index + 1][1] if index + 1 < len(positions) else len(message)
+        content = message[start + len(label):end].strip()
+        if key == "nextChoices":
+            sections[key] = [line.strip() for line in content.splitlines() if line.strip()]
+        else:
+            sections[key] = content
+    return sections
+
+
+def resolve_llm_client(injected_llm: LlmClient | None, repo: Repository) -> LlmClient | None:
+    if injected_llm is not None:
+        return injected_llm
+    settings = repo.get_llm_settings()
+    if settings and settings.get("enabled"):
+        base_url = str(settings.get("base_url") or "").strip()
+        api_key = str(settings.get("api_key") or "").strip()
+        model = str(settings.get("model") or "local-model").strip()
+        if base_url and api_key and model:
+            return OpenAICompatibleLlmClient(base_url=base_url, api_key=api_key, model=model)
+        return None
+    try:
+        return build_llm_client_from_env()
+    except ValueError:
+        logger.warning("llm.env_config_invalid", exc_info=True)
+        return None
+
+
+def public_llm_settings(settings: dict[str, Any] | None) -> dict[str, object]:
+    if settings is None:
+        return {
+            "enabled": False,
+            "base_url": "",
+            "model": "local-model",
+            "api_key_configured": False,
+            "masked_api_key": "",
+        }
+    api_key = str(settings.get("api_key") or "")
+    return {
+        "enabled": bool(settings.get("enabled")),
+        "base_url": str(settings.get("base_url") or ""),
+        "model": str(settings.get("model") or "local-model"),
+        "api_key_configured": bool(api_key),
+        "masked_api_key": mask_api_key(api_key),
+    }
+
+
+def mask_api_key(api_key: str) -> str:
+    if not api_key:
+        return ""
+    if len(api_key) <= 8:
+        return "••••"
+    return f"{api_key[:4]}…{api_key[-4:]}"
 
 
 def maybe_generate_llm_reply(
@@ -630,6 +741,7 @@ def maybe_generate_llm_reply(
         relationship_summary=str(session["relationship"]["display_summary"]),
         safety_events=list(session["safety_events"]),
         recent_memories=recent_memories,
+        recent_messages=public_chat_messages(repo.list_chat_messages(str(session["id"]))),
         choice_labels=[str(choice["label"]) for choice in card["choices"][:3]],
     )
     last_failure_reason: str | None = None

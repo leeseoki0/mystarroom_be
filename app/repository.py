@@ -110,6 +110,15 @@ class Repository:
                     FOREIGN KEY(session_id) REFERENCES sessions(id)
                 );
 
+                CREATE TABLE IF NOT EXISTS chat_messages (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(session_id) REFERENCES sessions(id)
+                );
+
                 CREATE TABLE IF NOT EXISTS plot_cards (
                     id TEXT PRIMARY KEY,
                     title TEXT NOT NULL,
@@ -176,6 +185,15 @@ class Repository:
                     FOREIGN KEY(profile_id) REFERENCES profiles(id),
                     FOREIGN KEY(session_id) REFERENCES sessions(id),
                     FOREIGN KEY(logbook_entry_id) REFERENCES logbook_entries(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS llm_settings (
+                    id TEXT PRIMARY KEY,
+                    enabled INTEGER NOT NULL,
+                    base_url TEXT NOT NULL,
+                    api_key TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
                 );
                 """
             )
@@ -253,6 +271,59 @@ class Repository:
                     now,
                 ),
             )
+
+    def get_llm_settings(self) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM llm_settings WHERE id = 'default'").fetchone()
+        if row is None:
+            return None
+        return {
+            "enabled": bool(row["enabled"]),
+            "base_url": row["base_url"],
+            "api_key": row["api_key"],
+            "model": row["model"],
+            "updated_at": row["updated_at"],
+        }
+
+    def update_llm_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
+        current = self.get_llm_settings() or {
+            "enabled": False,
+            "base_url": "",
+            "api_key": "",
+            "model": "",
+            "updated_at": utc_now(),
+        }
+        if "enabled" in payload and payload["enabled"] is not None:
+            current["enabled"] = bool(payload["enabled"])
+        for key in ("base_url", "model"):
+            if key in payload and payload[key] is not None:
+                current[key] = str(payload[key]).strip()
+        if "api_key" in payload and payload["api_key"] is not None:
+            api_key = str(payload["api_key"]).strip()
+            if api_key:
+                current["api_key"] = api_key
+        current["updated_at"] = utc_now()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO llm_settings (id, enabled, base_url, api_key, model, updated_at)
+                VALUES ('default', ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    enabled = excluded.enabled,
+                    base_url = excluded.base_url,
+                    api_key = excluded.api_key,
+                    model = excluded.model,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    1 if current["enabled"] else 0,
+                    current["base_url"],
+                    current["api_key"],
+                    current["model"],
+                    current["updated_at"],
+                ),
+            )
+        return current
 
     def create_profile(
         self,
@@ -752,6 +823,38 @@ class Repository:
             ).fetchall()
         return [str(row["summary"]) for row in rows]
 
+    def add_chat_message(self, session_id: str, role: str, content: str) -> dict[str, Any]:
+        message = {
+            "id": str(uuid.uuid4()),
+            "session_id": session_id,
+            "role": role,
+            "content": content,
+            "created_at": utc_now(),
+        }
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO chat_messages (id, session_id, role, content, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (message["id"], session_id, role, content, message["created_at"]),
+            )
+        return message
+
+    def list_chat_messages(self, session_id: str, limit: int = 20) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, session_id, role, content, created_at
+                FROM chat_messages
+                WHERE session_id = ?
+                ORDER BY created_at DESC, rowid DESC
+                LIMIT ?
+                """,
+                (session_id, limit),
+            ).fetchall()
+        return [row_to_chat_message(row) for row in reversed(rows)]
+
     def get_logbook_entry(self, entry_id: str) -> dict[str, Any] | None:
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM logbook_entries WHERE id = ?", (entry_id,)).fetchone()
@@ -998,6 +1101,16 @@ def row_to_logbook_entry(row: sqlite3.Row) -> dict[str, Any]:
         "reward_type": row["reward_type"],
         "user_deletable": bool(row["user_deletable"]),
         "deleted_at": row["deleted_at"],
+        "created_at": row["created_at"],
+    }
+
+
+def row_to_chat_message(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "session_id": row["session_id"],
+        "role": row["role"],
+        "content": row["content"],
         "created_at": row["created_at"],
     }
 
